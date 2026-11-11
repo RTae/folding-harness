@@ -11,6 +11,7 @@
 //! so it works the same on a live run and on one that finished last week — and
 //! a crashed dashboard cannot disturb a design run.
 
+pub mod chat;
 pub mod structure;
 
 use std::collections::HashMap;
@@ -1284,6 +1285,116 @@ mod tests {
         assert_eq!(app.tab, Tab::Population);
         app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(app.should_quit());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Produce a real finished run, then render every pane into an off-screen
+    /// buffer. Layout and indexing panics are the usual way a dashboard breaks,
+    /// and they only appear when something is actually drawn.
+    #[tokio::test]
+    async fn every_pane_renders_against_a_finished_run() {
+        use ratatui::backend::TestBackend;
+        use std::sync::Arc;
+
+        const YAML: &str = r#"
+name: tui-render-test
+binder:
+  topology: vhh
+  chains:
+    - label: H
+      sequence: QVQLVESGGGLVQAGGSLRLSCAASGYTFTSYAMGWFRQAPGKEREFVAAISWSGGSTYYADSVKGRFTISRDNAKNTVYLQMNSLKPEDTAVYYCAAGSYYDYWGQGTQVTVSS
+  regions:
+    - name: loop1
+      chain: H
+      start: 26
+      end: 33
+  fixed_residues: ["H:30"]
+target:
+  chains:
+    - label: A
+      sequence: MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVLAGG
+design:
+  cycles: 5
+  batch_size: 4
+  seed: 11
+gates:
+  min_iptm: 0.2
+  min_interface_plddt: 40.0
+  max_pae_interface: 30.0
+  max_clashes: 2
+  min_interface_contacts: 5
+  max_hydrophobic_patch: 0.9
+fold:
+  model: fixture
+  execution_mode: fixture
+"#;
+
+        let dir = std::env::temp_dir().join(format!("fh-tui-render-{}", crate::trace::now_ms()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let config = TaskConfig::from_yaml(YAML).expect("config parses");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+        let seed = config.design.seed;
+        let mut orchestrator = crate::orchestrator::Orchestrator::prepare(
+            config,
+            Arc::new(crate::fold::FixtureBackend::planted(
+                &scaffold, &scope, seed,
+            )),
+            Box::new(crate::agent::HeuristicAgent::new(seed)),
+            TaskPaths::new(&dir),
+            crate::TaskId("render".to_string()),
+        )
+        .await
+        .expect("prepares");
+        orchestrator.run().await.expect("runs");
+
+        let mut app = App::new(TaskPaths::new(&dir));
+        app.refresh();
+        assert!(!app.members().is_empty(), "nothing to draw");
+        assert!(app.selected().is_some());
+
+        // A wide terminal, then a cramped one: the constraints have to hold at
+        // both, and a narrow pane is where subtraction underflows.
+        for (width, height) in [(140, 44), (100, 30), (40, 12)] {
+            let mut terminal =
+                Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+            for tab in Tab::ALL {
+                app.tab = tab;
+                terminal
+                    .draw(|frame| app.draw(frame))
+                    .unwrap_or_else(|error| panic!("{tab:?} failed at {width}x{height}: {error}"));
+            }
+        }
+
+        // The overview actually shows the run, rather than rendering blank.
+        let mut terminal = Terminal::new(TestBackend::new(140, 44)).expect("test terminal");
+        app.tab = Tab::Overview;
+        terminal.draw(|frame| app.draw(frame)).expect("renders");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("tui-render-test"), "task name missing");
+        assert!(text.contains("fixture"), "backend missing");
+
+        // The structure pane draws the stored backbone for the selection.
+        app.tab = Tab::Structure;
+        terminal.draw(|frame| app.draw(frame)).expect("renders");
+        let structure: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            structure.contains("backbone") || structure.contains("no stored backbone"),
+            "structure pane drew neither a backbone nor an explanation"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

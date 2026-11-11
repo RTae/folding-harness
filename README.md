@@ -7,14 +7,20 @@ It ships a deterministic fixture backend, so the whole loop runs on a laptop
 with no GPU and no network, and a terminal dashboard, so a long run can be
 watched over SSH without forwarding a port.
 
-> **Status: scaffold.** The cycle, the contract, the gates, the population, the
-> trace and the dashboard are implemented and tested. The model-backed skills
-> (inverse folding, likelihood-guided mutation) are declared in the contract and
-> gated by the router, but have no executor yet — `fh skills` says which. The
-> fixture backend predicts nothing: it scores sequences against an optimum
-> planted from the run seed, so that orchestration can be tested without a
-> model. Anything a real run produces is a computational prediction and needs
-> experimental validation.
+> **Status: working proof of concept.** The cycle, the contract, the gates, the
+> population, the trace, the manifest and the dashboard are implemented, and 51
+> tests pass. `fh run` completes end to end both in-process and over HTTP, and
+> produces the identical run either way.
+>
+> Not done yet: the model-backed skills (inverse folding, likelihood-guided
+> mutation) are declared in the contract and gated by the router but have no
+> executor — `fh skills` says which. There is no real folding backend yet; see
+> the roadmap.
+>
+> The fixture backend **predicts nothing**. It scores a sequence by how closely
+> the mutable positions match an optimum planted from the run seed, so that
+> orchestration can be tested without a model. Anything a real backend produces
+> is a computational prediction and needs experimental validation.
 
 ## Why Rust is a reasonable choice here
 
@@ -63,6 +69,61 @@ cargo test --workspace
 # open the dashboard on the most recent run
 ./target/release/fh board
 ```
+
+## Setting up a run by chatting
+
+`fh chat` is the conversational entry point: describe what you want, and the
+model turns it into a plan.
+
+```bash
+export ANTHROPIC_API_KEY=...        # or: ANTHROPIC_AUTH_TOKEN from `ant auth login`
+fh chat --binder binder.fasta --target target.fasta
+```
+
+```
+┌─ conversation ───────────────────────────────┐┌─ plan ──────────────────────┐
+│ you:                                         ││ task        vhh-cdr-redesign │
+│   design the three CDR loops, keep H:52,     ││ topology    vhh              │
+│   20 cycles                                  ││ chain H      115 residues    │
+│ model:                                       ││ chain A       65 residues    │
+│   Three regions on H, H:52 pinned, gates     ││                              │
+│   permissive for a first run. {...}          ││ mutable     24 of 115 ...    │
+│ harness:                                     ││   loop1  residues 26..33     │
+│   Plan validated: 24 mutable of 115 binder   ││   loop2  residues 51..58     │
+│   residues across 3 regions. Ctrl-R to run.  ││   loop3  residues 99..108    │
+└──────────────────────────────────────────────┘│   fixed  91 cannot change    │
+┌─ message ────────────────────────────────────┐│                              │
+│ ▮                                            ││ Ctrl-R to run                │
+└──────────────────────────────────────────────┘└──────────────────────────────┘
+Enter send   Ctrl-R run plan   Ctrl-S save   PgUp/PgDn scroll   Esc quit
+```
+
+The pane on the right is **not the model's description of the plan** — it is what
+the typed config actually resolves to after the same validation a hand-written
+file gets. A hallucinated field fails `deny_unknown_fields`; a region past the
+end of a chain fails the scaffold check; a plan whose regions are all pinned
+fails as "nothing left to design". When a plan is rejected, the error goes back
+to the model so it can correct itself, and `Ctrl-R` does nothing until one
+validates. Nothing runs until you press it.
+
+Two deliberate limits:
+
+- **The model is never asked for a sequence.** There is no sequence field in the
+  plan schema. Sequences come from `--binder` and `--target` (a FASTA path, or a
+  bare sequence on the command line). A model that guessed a target and had it
+  folded would produce a confident, meaningless result.
+- **It proposes permissive gates for a first run**, because a gate above what the
+  starting sequence already scores admits nothing and leaves the search with no
+  ratchet. Tighten them once a run is clearing them.
+
+`fh task "<prose>" --binder ... --target ...` is the same thing without the
+interface: it prints the plan, writes `task.yaml`, and with `--run` starts it
+after a confirmation.
+
+The model only sees chain labels and lengths — not your sequences — when
+drafting a plan.
+
+## Running against a service
 
 To exercise the real network path, run the stub service and point a task at it:
 
@@ -158,36 +219,56 @@ be offered an inverse-folding skill.
 
 ## Layout
 
-A Cargo workspace, one crate per layer, dependencies pointing one way:
+One crate, `src/`, layered bottom up. Everything is Rust; there is no Python,
+no Node, and no second runtime.
 
-| crate | holds | depends on |
-| --- | --- | --- |
-| `fh-core` | scaffold, mutable scope, proposals, candidates, metrics, gates, population, search state | — |
-| `fh-contract` | the `fh.fold/v1` wire types | — |
-| `fh-fold` | `FoldBackend` trait, fixture, HTTP client, stub server | core, contract |
-| `fh-skills` | design skills and the router | core |
-| `fh-agent` | the decision layer: heuristic agent, model-provider seam | core |
-| `fh-trace` | event log, task directory layout, run manifest | core, contract |
-| `fh-orchestrator` | the cycle | all of the above |
-| `fh-tui` | the dashboard | core, contract, trace |
-| `fh-cli` | the `fh` command | all of the above |
+| path | holds |
+| --- | --- |
+| `src/ids.rs` | newtype identifiers, so a chain index cannot be passed as a candidate id |
+| `src/scaffold.rs` | chains, regions, pinned residues, and `MutableScope` — **the invariant lives here** |
+| `src/proposal.rs` | `SkillId`, `Capability`, and the validated `Proposal` |
+| `src/candidate.rs` | a candidate and where it came from |
+| `src/metrics.rs` | metrics, loss weights, the weighted loss and its breakdown |
+| `src/gate.rs` | hard gates and rejection reasons |
+| `src/population.rs` | admission: dedup, diversity, capacity, parent selection |
+| `src/search.rs` | per-cycle history, skill statistics, stagnation |
+| `src/config.rs` | the task YAML, and the one-based to zero-based conversion |
+| `src/contract.rs` | the `fh.fold/v1` wire types |
+| `src/fold/` | `FoldBackend` trait, `fixture.rs`, `http.rs`, `server.rs` |
+| `src/skills/` | design skills and `router.rs` |
+| `src/agent.rs` | the decision layer and the `ModelProvider` trait |
+| `src/provider.rs` | the Claude Messages API over raw HTTP |
+| `src/plan.rs` | prose to a validated task config |
+| `src/fasta.rs` | a minimal FASTA reader |
+| `src/trace.rs` | event log, task directory layout, run manifest |
+| `src/orchestrator.rs` | the cycle |
+| `src/tui/` | the dashboard, `chat.rs`, and `structure.rs` (the backbone projection) |
+| `src/main.rs` | the `fh` command |
+| `src/tests.rs` | tests for the domain layer |
 
-The split is a choice, not a Rust requirement — a single crate with modules
-would work. It buys enforced dependency direction (`fh-core` cannot accidentally
-depend on the UI), a contract crate publishable on its own, the stub server
-behind a feature flag so a client build does not compile `axum`, and parallel
-rebuilds.
+The layering is a convention here rather than something the compiler enforces,
+so `CLAUDE.md` states it: `scaffold`/`proposal`/`candidate`/`metrics`/`gate`/
+`population`/`search`/`config` do no I/O, `contract` depends only on `serde`,
+and nothing below `orchestrator` reaches upward.
 
 ## Roadmap
 
 Nearest first:
 
-1. **A real backend adapter.** Boltz-2 and Chai-1 ship code *and* weights under
-   MIT/Apache-2.0, which makes them the practical first targets; both are CLI-only
-   today, so the adapter is a service wrapping a CLI. AlphaFold 3's code is
-   Apache-2.0 but its weights are non-commercial, must not be redistributed, and
-   may not be used to train competing predictors — read
-   `WEIGHTS_TERMS_OF_USE.md` before wiring it up.
+1. **A real backend adapter.** Boltz-2 (MIT) and Chai-1 (Apache-2.0) ship code
+   *and* weights openly, which makes them the practical first targets; both are
+   CLI-only, so the adapter is a thin service wrapping a CLI behind
+   `src/contract.rs`. `RosettaCommons/foundry` is also worth a look — BSD-3
+   covering code *and* weights, one install for RFD3, RoseTTAFold3 and
+   ProteinMPNN/LigandMPNN. Tamarind Bio exposes a hosted REST API with a real
+   job queue if you would rather not run GPUs. AlphaFold 3's code is Apache-2.0
+   but its weights are non-commercial, must not be redistributed (including
+   derived weights), and may not be used to train competing predictors — read
+   `WEIGHTS_TERMS_OF_USE.md` before wiring it up, and note that AlphaFold Server
+   has no API.
+   Licensing is not uniform even within one repo: some projects' LICENSE covers
+   weights explicitly, some are silent, and some put weights under a separate
+   agreement. Record which, per backend, in its adapter.
 2. **Output re-verification.** Check the returned structure's sequence against
    the proposal, so a backend that silently renumbers or substitutes is caught
    rather than scored.
@@ -197,7 +278,7 @@ Nearest first:
    continue; `TraceWriter::append` exists for it.
 5. **An MCP server.** `rmcp` is the official Rust SDK, and MCP's Tasks extension
    is a close match for this job contract — that is how the harness gets driven
-   by an agent instead of reimplementing an agent loop.
+   by an agent instead of only driving one.
 6. **Cost accounting.** GPU-seconds and token spend per run, which the open
    harnesses in this space generally do not surface.
 
