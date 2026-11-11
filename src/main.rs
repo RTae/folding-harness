@@ -32,6 +32,31 @@ struct Cli {
     command: Command,
 }
 
+/// Where to send prompts, and how to shape the request.
+///
+/// A custom `--url` is for a proxy, gateway or self-hosted endpoint. The
+/// harness prints the host before sending anything, and drops the
+/// Anthropic-specific request fields, which a gateway may not accept.
+#[derive(clap::Args, Debug, Clone)]
+struct ProviderOptions {
+    /// Endpoint base URL, e.g. https://gateway.example.com. Defaults to
+    /// $ANTHROPIC_BASE_URL, else the first-party API.
+    #[arg(long)]
+    url: Option<String>,
+    /// Model name. Defaults to $ANTHROPIC_MODEL, else claude-opus-5-5. A
+    /// custom endpoint usually needs this set to something it serves.
+    #[arg(long)]
+    model: Option<String>,
+    /// `anthropic-version` header, for an endpoint that wants an older one
+    /// (e.g. 2023-06-01). Defaults to $ANTHROPIC_API_VERSION.
+    #[arg(long)]
+    api_version: Option<String>,
+    /// Send output_config.effort: low, medium, high, xhigh or max. Omitted by
+    /// default on a custom endpoint; set it if the endpoint supports it.
+    #[arg(long)]
+    effort: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Write an example task config.
@@ -76,9 +101,8 @@ enum Command {
         target: Vec<String>,
         #[arg(long, default_value_t = 20261111)]
         seed: u64,
-        /// Override the model (default: the provider's own default).
-        #[arg(long)]
-        model: Option<String>,
+        #[command(flatten)]
+        provider: ProviderOptions,
         #[arg(long)]
         task_root: Option<PathBuf>,
         /// Artificial per-fold delay once a confirmed run starts.
@@ -95,8 +119,8 @@ enum Command {
         target: Vec<String>,
         #[arg(long, default_value_t = 20261111)]
         seed: u64,
-        #[arg(long)]
-        model: Option<String>,
+        #[command(flatten)]
+        provider: ProviderOptions,
         /// Write the plan here instead of task.yaml.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -132,7 +156,15 @@ enum Command {
         latency_ms: u64,
     },
     /// Check the local setup, and a task config and its backend if given.
-    Doctor { task: Option<PathBuf> },
+    Doctor {
+        task: Option<PathBuf>,
+        /// Also send one tiny request to the model endpoint to prove the URL,
+        /// key and model work together. This costs a few tokens.
+        #[arg(long)]
+        probe_model: bool,
+        #[command(flatten)]
+        provider: ProviderOptions,
+    },
     /// List the design skills this build knows about.
     Skills,
     /// List recorded runs.
@@ -169,7 +201,7 @@ async fn main() -> Result<()> {
             binder,
             target,
             seed,
-            model,
+            provider,
             task_root,
             latency_ms,
         } => {
@@ -177,7 +209,7 @@ async fn main() -> Result<()> {
                 binder,
                 target,
                 seed,
-                model,
+                provider,
                 task_root,
                 Duration::from_millis(latency_ms),
             )
@@ -188,12 +220,17 @@ async fn main() -> Result<()> {
             binder,
             target,
             seed,
-            model,
+            provider,
             out,
             run,
             yes,
             task_root,
-        } => task_from_prose(prose, binder, target, seed, model, out, run, yes, task_root).await,
+        } => {
+            task_from_prose(
+                prose, binder, target, seed, provider, out, run, yes, task_root,
+            )
+            .await
+        }
         Command::Board {
             path,
             task,
@@ -204,7 +241,11 @@ async fn main() -> Result<()> {
             task,
             latency_ms,
         } => serve(port, task, Duration::from_millis(latency_ms)).await,
-        Command::Doctor { task } => doctor(task).await,
+        Command::Doctor {
+            task,
+            probe_model,
+            provider,
+        } => doctor(task, probe_model, provider).await,
         Command::Skills => {
             skills();
             Ok(())
@@ -480,10 +521,23 @@ fn load_chains(values: &[String], default_label: &str) -> Result<Vec<PlanChain>>
     Ok(out)
 }
 
-fn make_provider(model: Option<String>) -> Result<AnthropicProvider> {
+/// Build the provider from the environment, then apply the flags.
+///
+/// Order matters: `with_base_url` resets the Anthropic-specific extras, so an
+/// explicit `--effort` after it still wins.
+fn make_provider(options: &ProviderOptions) -> Result<AnthropicProvider> {
     let mut provider = AnthropicProvider::from_env().map_err(|error| anyhow!("{error}"))?;
-    if let Some(model) = model {
-        provider = provider.with_model(model);
+    if let Some(url) = &options.url {
+        provider = provider.with_base_url(url.clone());
+    }
+    if let Some(model) = &options.model {
+        provider = provider.with_model(model.clone());
+    }
+    if let Some(version) = &options.api_version {
+        provider = provider.with_api_version(version.clone());
+    }
+    if let Some(effort) = &options.effort {
+        provider = provider.with_effort(Some(effort.clone()));
     }
     Ok(provider)
 }
@@ -504,13 +558,15 @@ async fn chat(
     binder: Vec<String>,
     target: Vec<String>,
     seed: u64,
-    model: Option<String>,
+    options: ProviderOptions,
     task_root: Option<PathBuf>,
     latency: Duration,
 ) -> Result<()> {
     let binder_chains = load_chains(&binder, "H")?;
     let target_chains = load_chains(&target, "A")?;
-    let provider: Arc<dyn ModelProvider> = Arc::new(make_provider(model)?);
+    let built = make_provider(&options)?;
+    println!("model {}", built.describe());
+    let provider: Arc<dyn ModelProvider> = Arc::new(built);
 
     // The screen runs on a blocking thread so the runtime stays free to make
     // the model call while the interface keeps drawing.
@@ -540,7 +596,7 @@ async fn task_from_prose(
     binder: Vec<String>,
     target: Vec<String>,
     seed: u64,
-    model: Option<String>,
+    options: ProviderOptions,
     out: Option<PathBuf>,
     start: bool,
     yes: bool,
@@ -548,9 +604,10 @@ async fn task_from_prose(
 ) -> Result<()> {
     let binder_chains = load_chains(&binder, "H")?;
     let target_chains = load_chains(&target, "A")?;
-    let provider = make_provider(model)?;
+    let provider = make_provider(&options)?;
 
-    println!("asking {} for a plan...", provider.model_name());
+    println!("model {}", provider.describe());
+    println!("asking for a plan...");
     let plan = fh::plan::draft(&provider, &prose, &binder_chains, &target_chains, seed)
         .await
         .map_err(|error| anyhow!("{error}"))?;
@@ -644,7 +701,7 @@ async fn serve(port: u16, task: Option<PathBuf>, latency: Duration) -> Result<()
         .map_err(|error| anyhow!("serving: {error}"))
 }
 
-async fn doctor(task: Option<PathBuf>) -> Result<()> {
+async fn doctor(task: Option<PathBuf>, probe_model: bool, options: ProviderOptions) -> Result<()> {
     println!("fh          {}", env!("CARGO_PKG_VERSION"));
     println!("protocol    {}", fh::contract::PROTOCOL);
 
@@ -653,6 +710,34 @@ async fn doctor(task: Option<PathBuf>) -> Result<()> {
     match std::fs::create_dir_all(&root) {
         Ok(()) => println!("            writable"),
         Err(error) => println!("            NOT writable: {error}"),
+    }
+
+    if probe_model {
+        println!();
+        match make_provider(&options) {
+            Err(error) => {
+                println!("model       NOT CONFIGURED");
+                println!("            {error}");
+                return Err(anyhow!("model provider not configured"));
+            }
+            Ok(provider) => {
+                println!("model       {}", provider.describe());
+                println!("            version {}", provider.api_version());
+                print!("            probing ... ");
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                match provider.probe().await {
+                    Ok(reply) => {
+                        println!("ok: {}", reply.trim().chars().take(60).collect::<String>())
+                    }
+                    Err(error) => {
+                        println!("FAILED");
+                        println!("            {error}");
+                        return Err(anyhow!("model probe failed"));
+                    }
+                }
+            }
+        }
     }
 
     let Some(task) = task else {

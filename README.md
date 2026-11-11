@@ -150,6 +150,40 @@ Two deliberate limits:
 interface: it prints the plan, writes `task.yaml`, and with `--run` starts it
 after a confirmation.
 
+### A custom endpoint
+
+Any Messages-compatible endpoint works — a proxy, a gateway, a router, or
+something self-hosted:
+
+```bash
+export ANTHROPIC_API_KEY=...
+fh doctor --probe-model \
+  --url https://gateway.example.com \
+  --model claude-opus-4-7 \
+  --api-version 2023-06-01
+```
+
+`--probe-model` sends one tiny request and prints what came back, so a wrong
+URL, key or model name is a one-line answer rather than a failure in the middle
+of a plan. The same four flags work on `fh chat` and `fh task`, and
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` and `ANTHROPIC_API_VERSION` set them
+from the environment.
+
+Two things change when the URL is not the first-party API:
+
+- **The request drops to the compatible subset** — `model`, `max_tokens`,
+  `system`, `messages`. Server-side refusal fallback and
+  `output_config.effort` are features of Anthropic's own API, and a gateway
+  that does not know a field may reject the whole request over it. Pass
+  `--effort high` to send it anyway if your endpoint supports it.
+- **The host is printed before any prompt is sent**, and flagged as
+  third-party. Prompts leave for that host, so whoever runs it can read them.
+  The harness only ever sends chain labels and lengths when drafting a plan,
+  never your sequences, but that is a property of this one code path rather
+  than a guarantee about anything you type into the chat.
+
+Keys belong in the environment, never in a task config or a committed file.
+
 The model only sees chain labels and lengths — not your sequences — when
 drafting a plan.
 
