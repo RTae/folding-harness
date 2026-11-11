@@ -24,35 +24,6 @@ setting a run up by describing it.
 > orchestration can be tested without a model. Anything a real backend produces
 > is a computational prediction and needs experimental validation.
 
-## Why Rust is a reasonable choice here
-
-The harness never touches a tensor. It submits a job, polls for a result, and
-reads back confidence numbers and a structure. Everything on this side of that
-boundary is ordinary systems code: orchestration, config validation, gates,
-population management, provenance, the interfaces. A typed language helps with
-some of it.
-
-- **The immutable-scope guarantee.** You cannot edit a sequence directly.
-  Changes go through `MutableScope::propose`, which validates every
-  substitution against the scope and is the only constructor of a `Proposal`.
-  `Proposal` has no `Deserialize` impl, so one cannot arrive from a config file
-  or an API payload either. "Framework residues are never mutated" is a
-  property of the types, not a convention a skill has to remember. Tooling in
-  this field disagrees about residue numbering, with 1-based per chain,
-  PDB-native with insertion codes, and contig strings all in use, and
-  off-by-one errors there are silent. This harness converts once, at the config
-  boundary, and the conversion has a test.
-- **One process, one language, no second runtime.** The dashboard is the same
-  binary as the runner. There is no Node or Python process beside it.
-- **Cheap long-running processes.** A design run is mostly waiting on a GPU
-  service. `tokio` makes bounded-concurrency folds and a tailable event log
-  straightforward, and the interfaces read files rather than holding a socket,
-  so neither can disturb a run.
-
-The cost is real. Structure parsing, metrics and the models themselves live in
-Python's ecosystem, which is why they stay behind the contract. `pdbtbx` reads
-mmCIF in Rust if a future adapter needs it.
-
 ## Install
 
 Needs a Rust toolchain at 1.82 or newer. If you have `rustup`, the pin in
