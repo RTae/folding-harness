@@ -106,6 +106,8 @@ model turns it into a plan.
 ```bash
 export ANTHROPIC_API_KEY=...        # or: ANTHROPIC_AUTH_TOKEN from `ant auth login`
 fh chat --binder binder.fasta --target target.fasta
+# or inline, without files:
+# fh chat --binder QVQLVESGGG... --target MKTVRQERLK...
 ```
 
 ```
