@@ -1,0 +1,10 @@
+[package]
+name = "fh-contract"
+description = "Wire types for the fh.fold/v1 compute contract. Deliberately dependency-light so a service can implement it without the rest of the harness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true

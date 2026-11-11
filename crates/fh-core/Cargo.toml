@@ -1,0 +1,13 @@
+[package]
+name = "fh-core"
+description = "Domain types for the folding harness: scaffolds, mutable scope, proposals, candidates, metrics, gates, population"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+rand.workspace = true

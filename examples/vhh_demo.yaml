@@ -1,0 +1,95 @@
+# A runnable demo task for the fixture backend.
+#
+# Both sequences below are placeholders: the binder is a generic single-domain
+# framework and the target is a synthetic sequence, present only so the fixture
+# backend has two chains to work with. Nothing here is a claim about any real
+# molecule, and the fixture does not predict anything — it scores sequences
+# against an optimum planted from the run seed. Replace both before doing
+# anything real, and point `fold` at a compute service.
+#
+# Residue positions are one-based and inclusive, as written in the literature.
+
+name: vhh-demo
+notes: >
+  Fixture demo: shows the design cycle, the gates, the population, and the
+  terminal dashboard without touching a GPU.
+
+binder:
+  topology: vhh
+  chains:
+    - label: H
+      sequence: QVQLVESGGGLVQAGGSLRLSCAASGYTFTSYAMGWFRQAPGKEREFVAAISWSGGSTYYADSVKGRFTISRDNAKNTVYLQMNSLKPEDTAVYYCAAGSYYDYWGQGTQVTVSS
+
+  # Only these spans may change. Everything else is framework and is immutable
+  # by construction, not by convention.
+  regions:
+    - name: loop1
+      chain: H
+      start: 26
+      end: 33
+    - name: loop2
+      chain: H
+      start: 51
+      end: 58
+    - name: loop3
+      chain: H
+      start: 99
+      end: 108
+
+  # Pinned even though they fall inside a mutable region.
+  fixed_residues:
+    - "H:52"
+
+target:
+  chains:
+    - label: A
+      sequence: MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVLAGG
+
+design:
+  cycles: 14
+  batch_size: 6
+  seed: 20261111
+  max_substitutions: 3
+  stagnation_window: 3
+  stagnation_epsilon: 0.001
+  concurrency: 4
+  skills:
+    - point_mutation
+    - region_redesign
+
+population:
+  capacity: 16
+  min_hamming: 1
+  parent_temperature: 0.05
+
+# Hard thresholds. A candidate that fails any of these is recorded as rejected
+# and never enters the population, whatever its loss.
+gates:
+  min_iptm: 0.45
+  min_interface_plddt: 60.0
+  max_pae_interface: 15.0
+  max_clashes: 2
+  min_interface_contacts: 10
+  max_hydrophobic_patch: 0.75
+
+# Weights on the normalised loss terms. Lower loss is better.
+loss:
+  iptm: 3.0
+  interface_plddt: 2.0
+  pae_interface: 1.0
+  interface_contacts: 1.0
+  clashes: 2.0
+  hydrophobic_patch: 0.5
+  net_charge: 0.25
+  plddt_mean: 0.5
+
+fold:
+  model: fixture
+  execution_mode: fixture
+  seeds: [973520]
+  diffusion_samples: 1
+  diffusion_steps: 200
+  use_msa: false
+  need_atom_confidence: true
+  poll_interval_secs: 2.0
+  timeout_secs: 1800

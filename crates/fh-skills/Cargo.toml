@@ -1,0 +1,12 @@
+[package]
+name = "fh-skills"
+description = "Design skills and the router that decides which of them are legal in a given cycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fh-core.workspace = true
+rand.workspace = true
+serde.workspace = true
