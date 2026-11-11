@@ -109,7 +109,7 @@ enum Command {
         #[arg(long)]
         resume: Option<String>,
         /// Carry on the most recent chat.
-        #[arg(long, name = "continue")]
+        #[arg(long = "continue")]
         continue_last: bool,
         #[arg(long, default_value_t = 20261111)]
         seed: u64,
