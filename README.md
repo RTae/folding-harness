@@ -50,25 +50,53 @@ The cost is real: structure parsing, metrics and the models themselves live in
 Python's ecosystem. That is why they stay behind the contract. `pdbtbx` can read
 mmCIF in Rust if a future adapter needs it.
 
-## Install and run
+## Install
 
-Needs a recent stable Rust toolchain.
+Needs a Rust toolchain at 1.82 or newer. If you have `rustup`, the pin in
+`rust-toolchain.toml` takes care of it; otherwise install Rust from
+[rustup.rs](https://rustup.rs).
 
 ```bash
-cargo build --release
-cargo test --workspace
-
-# write an example task, check it, run it
-./target/release/fh init task.yaml
-./target/release/fh validate task.yaml
-./target/release/fh run task.yaml
-
-# watch it in the terminal instead of streaming events
-./target/release/fh run task.yaml --board --latency-ms 250
-
-# open the dashboard on the most recent run
-./target/release/fh board
+git clone <this repo> && cd folding-harness
+cargo install --path . --locked      # puts `fh` in ~/.cargo/bin
+fh --version
 ```
+
+If `fh` is not found afterwards, `~/.cargo/bin` is not on your `PATH` — add it,
+or run `rustup update` which sets it up. To remove it later:
+`cargo uninstall folding-harness`.
+
+Prefer not to install? `cargo build --release` and use
+`./target/release/fh` everywhere `fh` appears below.
+
+## First run
+
+No GPU, no network, no API key: the default backend is a deterministic fixture.
+
+```bash
+fh init task.yaml        # write an example task config
+fh validate task.yaml    # check it, and print what may and may not change
+fh run task.yaml         # run it, streaming events to stdout
+```
+
+`fh validate` is worth reading before the first run — it prints the mutable
+scope, which is the thing most likely to be wrong, and the routing table, which
+says which design skills are available and why the others are not.
+
+Then look at the result:
+
+```bash
+fh board                                  # dashboard on the most recent run
+fh run task.yaml --board --latency-ms 250 # or watch a run as it happens
+```
+
+`--latency-ms` slows the fixture down so the cycles are visible; without it a
+14-cycle run finishes in under a second. In the dashboard: `1`–`5` or `Tab`
+switch panes, `j`/`k` select a candidate, `h`/`l`/`u`/`d` rotate the backbone,
+`+`/`-` zoom, `q` quits.
+
+Other commands: `fh skills` lists the design skills and which are implemented,
+`fh ls` lists past runs, `fh doctor task.yaml` checks the setup and the backend.
 
 ## Setting up a run by chatting
 

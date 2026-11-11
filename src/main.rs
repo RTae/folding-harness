@@ -8,9 +8,11 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
-use fh::agent::{DesignAgent, HeuristicAgent};
+use fh::agent::{DesignAgent, HeuristicAgent, ModelProvider};
 use fh::fold::{FixtureBackend, FoldBackend, HttpBackend};
 use fh::orchestrator::Orchestrator;
+use fh::plan::Chain as PlanChain;
+use fh::provider::AnthropicProvider;
 use fh::skills::{executor, Router};
 use fh::trace::{RunManifest, TaskPaths};
 use fh::{Capability, ExecutionMode, SearchState, SkillId, TaskConfig, TaskId};
@@ -63,6 +65,49 @@ enum Command {
         /// Artificial per-fold delay for the fixture backend, to watch a run.
         #[arg(long, default_value_t = 0)]
         latency_ms: u64,
+    },
+    /// Chat with a model to set up a run, see the validated plan, then confirm.
+    Chat {
+        /// Binder chain: a FASTA path, or a bare sequence. Repeatable.
+        #[arg(long, required = true)]
+        binder: Vec<String>,
+        /// Target chain: a FASTA path, or a bare sequence. Repeatable.
+        #[arg(long, required = true)]
+        target: Vec<String>,
+        #[arg(long, default_value_t = 20261111)]
+        seed: u64,
+        /// Override the model (default: the provider's own default).
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        task_root: Option<PathBuf>,
+        /// Artificial per-fold delay once a confirmed run starts.
+        #[arg(long, default_value_t = 0)]
+        latency_ms: u64,
+    },
+    /// One-shot version of `chat`: describe the run in prose on the command line.
+    Task {
+        /// What you want, in prose.
+        prose: String,
+        #[arg(long, required = true)]
+        binder: Vec<String>,
+        #[arg(long, required = true)]
+        target: Vec<String>,
+        #[arg(long, default_value_t = 20261111)]
+        seed: u64,
+        #[arg(long)]
+        model: Option<String>,
+        /// Write the plan here instead of task.yaml.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Start the run after the plan is confirmed.
+        #[arg(long)]
+        run: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        task_root: Option<PathBuf>,
     },
     /// Open the dashboard on a task directory.
     Board {
@@ -120,6 +165,35 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Chat {
+            binder,
+            target,
+            seed,
+            model,
+            task_root,
+            latency_ms,
+        } => {
+            chat(
+                binder,
+                target,
+                seed,
+                model,
+                task_root,
+                Duration::from_millis(latency_ms),
+            )
+            .await
+        }
+        Command::Task {
+            prose,
+            binder,
+            target,
+            seed,
+            model,
+            out,
+            run,
+            yes,
+            task_root,
+        } => task_from_prose(prose, binder, target, seed, model, out, run, yes, task_root).await,
         Command::Board {
             path,
             task,
@@ -276,6 +350,17 @@ async fn run(
         config.fold.execution_mode = ExecutionMode::Service;
     }
 
+    run_config(config, task_root, open_board, latency).await
+}
+
+/// Prepare and run an already-resolved config. Shared by `fh run`, `fh task`
+/// and the chat screen, so all three behave identically once a plan exists.
+async fn run_config(
+    config: TaskConfig,
+    task_root: Option<PathBuf>,
+    open_board: bool,
+    latency: Duration,
+) -> Result<()> {
     let (scaffold, scope) = config.resolve().context("resolving the scaffold")?;
     let backend = backend_for(&config, &scaffold, &scope, latency)?;
     let agent: Box<dyn DesignAgent> = Box::new(HeuristicAgent::new(config.design.seed));
@@ -374,6 +459,130 @@ fn report(summary: &fh::orchestrator::RunSummary) {
     println!(
         "         (numbers above come from the configured backend; a fixture run predicts nothing)"
     );
+}
+
+/// Load chains from FASTA paths or bare sequences. The first unlabelled chain
+/// gets `default_label`, so `--binder QVQL...` works without a FASTA header.
+fn load_chains(values: &[String], default_label: &str) -> Result<Vec<PlanChain>> {
+    let mut out = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        let label = if index == 0 {
+            default_label.to_string()
+        } else {
+            format!("{default_label}{}", index + 1)
+        };
+        let records = fh::fasta::load_or_literal(value, &label)
+            .with_context(|| format!("reading chain from '{value}'"))?;
+        for record in records {
+            out.push(PlanChain::new(record.label, record.sequence));
+        }
+    }
+    Ok(out)
+}
+
+fn make_provider(model: Option<String>) -> Result<AnthropicProvider> {
+    let mut provider = AnthropicProvider::from_env().map_err(|error| anyhow!("{error}"))?;
+    if let Some(model) = model {
+        provider = provider.with_model(model);
+    }
+    Ok(provider)
+}
+
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+async fn chat(
+    binder: Vec<String>,
+    target: Vec<String>,
+    seed: u64,
+    model: Option<String>,
+    task_root: Option<PathBuf>,
+    latency: Duration,
+) -> Result<()> {
+    let binder_chains = load_chains(&binder, "H")?;
+    let target_chains = load_chains(&target, "A")?;
+    let provider: Arc<dyn ModelProvider> = Arc::new(make_provider(model)?);
+
+    // The screen runs on a blocking thread so the runtime stays free to make
+    // the model call while the interface keeps drawing.
+    let runtime = tokio::runtime::Handle::current();
+    let confirmed = tokio::task::spawn_blocking(move || {
+        fh::tui::chat::run(provider, runtime, binder_chains, target_chains, seed)
+    })
+    .await
+    .context("chat thread")?
+    .context("running the chat screen")?;
+
+    match confirmed {
+        None => {
+            println!("no plan confirmed; nothing ran");
+            Ok(())
+        }
+        Some(config) => {
+            println!("running the confirmed plan: {}", config.name);
+            run_config(config, task_root, true, latency).await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn task_from_prose(
+    prose: String,
+    binder: Vec<String>,
+    target: Vec<String>,
+    seed: u64,
+    model: Option<String>,
+    out: Option<PathBuf>,
+    start: bool,
+    yes: bool,
+    task_root: Option<PathBuf>,
+) -> Result<()> {
+    let binder_chains = load_chains(&binder, "H")?;
+    let target_chains = load_chains(&target, "A")?;
+    let provider = make_provider(model)?;
+
+    println!("asking {} for a plan...", provider.model_name());
+    let plan = fh::plan::draft(&provider, &prose, &binder_chains, &target_chains, seed)
+        .await
+        .map_err(|error| anyhow!("{error}"))?;
+
+    println!();
+    for line in plan.summary() {
+        println!("{line}");
+    }
+    if let Some(notes) = &plan.config.notes {
+        println!();
+        println!("notes       {notes}");
+    }
+    println!();
+    println!("A prediction is not a measurement; results need experimental validation.");
+    println!();
+
+    let destination = out.unwrap_or_else(|| PathBuf::from("task.yaml"));
+    let yaml = plan.config.to_yaml().context("serialising the plan")?;
+    std::fs::write(&destination, yaml)
+        .with_context(|| format!("writing {}", destination.display()))?;
+    println!("plan written to {}", destination.display());
+
+    if !start {
+        println!("run it with: fh run {}", destination.display());
+        return Ok(());
+    }
+    if !yes && !confirm("Start this run?")? {
+        println!("not started");
+        return Ok(());
+    }
+
+    run_config(plan.config, task_root, false, Duration::ZERO).await
 }
 
 fn resolve_task_dir(path: Option<PathBuf>, task: Option<String>) -> Result<TaskPaths> {
@@ -536,8 +745,8 @@ fn list_runs() -> Result<()> {
     }
 
     println!(
-        "{:<34} {:<18} {:>7} {:>10}  {}",
-        "task", "name", "cycles", "best", "state"
+        "{:<34} {:<18} {:>7} {:>10}  state",
+        "task", "name", "cycles", "best"
     );
     for paths in found.iter().take(40) {
         let id = paths
@@ -561,10 +770,7 @@ fn list_runs() -> Result<()> {
                     "incomplete"
                 }
             ),
-            Err(_) => println!(
-                "{:<34} {:<18} {:>7} {:>10}  {}",
-                id, "-", "-", "-", "no manifest"
-            ),
+            Err(_) => println!("{:<34} {:<18} {:>7} {:>10}  no manifest", id, "-", "-", "-"),
         }
     }
     Ok(())

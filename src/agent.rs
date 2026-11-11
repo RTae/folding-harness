@@ -170,13 +170,65 @@ impl DesignAgent for HeuristicAgent {
     }
 }
 
-/// A text-completion model. Implement this over whichever API you use; the
-/// harness never assumes a vendor, a transport, or a tool-calling format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    User,
+    Assistant,
+}
+
+impl ChatRole {
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub text: String,
+}
+
+impl ChatMessage {
+    pub fn user(text: impl Into<String>) -> Self {
+        ChatMessage {
+            role: ChatRole::User,
+            text: text.into(),
+        }
+    }
+
+    pub fn assistant(text: impl Into<String>) -> Self {
+        ChatMessage {
+            role: ChatRole::Assistant,
+            text: text.into(),
+        }
+    }
+}
+
+/// A text model. Implement this over whichever API you use; the harness never
+/// assumes a vendor, a transport, or a tool-calling format.
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn model(&self) -> &str;
 
     async fn complete(&self, system: &str, user: &str) -> Result<String, AgentError>;
+
+    /// Multi-turn conversation, for the chat interface.
+    ///
+    /// The default flattens the turns into one message, so a provider that can
+    /// only do single completions still works. A provider with a real messages
+    /// array should override this: flattening loses the role structure and any
+    /// prefix caching that depends on it.
+    async fn converse(&self, system: &str, messages: &[ChatMessage]) -> Result<String, AgentError> {
+        let flattened = messages
+            .iter()
+            .map(|message| format!("{}: {}", message.role.wire_name(), message.text))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.complete(system, &flattened).await
+    }
 }
 
 /// System and user prompt for one choice. Exposed so it can be inspected and
