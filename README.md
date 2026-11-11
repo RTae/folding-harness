@@ -1,20 +1,22 @@
 # folding-harness
 
-A design harness in Rust: the orchestration, typing and inspection around a
-structure-prediction backend, with the backend behind a versioned HTTP contract.
+A design harness in Rust. It holds the orchestration, typing and inspection
+around a structure-prediction backend, and the backend sits behind a versioned
+HTTP contract.
 
 It ships a deterministic fixture backend, so the whole loop runs on a laptop
-with no GPU and no network, and a terminal dashboard, so a long run can be
-watched over SSH without forwarding a port.
+with no GPU and no network. It also ships two terminal interfaces: a dashboard
+for watching a run over SSH without forwarding a port, and a chat screen for
+setting a run up by describing it.
 
 > **Status: working proof of concept.** The cycle, the contract, the gates, the
-> population, the trace, the manifest and the dashboard are implemented, and 51
-> tests pass. `fh run` completes end to end both in-process and over HTTP, and
-> produces the identical run either way.
+> population, the trace, the manifest, the dashboard and the chat screen are
+> implemented, and 106 tests pass. `fh run` completes end to end both in-process
+> and over HTTP, and produces the identical run either way.
 >
-> Not done yet: the model-backed skills (inverse folding, likelihood-guided
-> mutation) are declared in the contract and gated by the router but have no
-> executor — `fh skills` says which. There is no real folding backend yet; see
+> Not done yet: the model-backed skills, inverse folding and likelihood-guided
+> mutation, are declared in the contract and gated by the router but have no
+> executor. `fh skills` says which. There is no real folding backend yet. See
 > the roadmap.
 >
 > The fixture backend **predicts nothing**. It scores a sequence by how closely
@@ -26,34 +28,35 @@ watched over SSH without forwarding a port.
 
 The harness never touches a tensor. It submits a job, polls for a result, and
 reads back confidence numbers and a structure. Everything on this side of that
-boundary — orchestration, config validation, gates, population management,
-provenance, the UI — is ordinary systems code, and three things get better in a
-typed language:
+boundary is ordinary systems code: orchestration, config validation, gates,
+population management, provenance, the interfaces. A typed language helps with
+some of it.
 
-- **The immutable-scope guarantee.** A sequence cannot be edited directly.
-  Changes go through `MutableScope::propose`, which validates every substitution
-  against the scope and is the only constructor of a `Proposal`; `Proposal` has
-  no `Deserialize` impl, so one cannot arrive from a config file or an API
-  payload either. "Framework residues are never mutated" is a property of the
-  types, not a convention a skill has to remember. Tooling in this field
-  disagrees about residue numbering — 1-based per chain, PDB-native with
-  insertion codes, contig strings — and off-by-one errors there are silent. This
-  harness converts once, at the config boundary, and the conversion has a test.
+- **The immutable-scope guarantee.** You cannot edit a sequence directly.
+  Changes go through `MutableScope::propose`, which validates every
+  substitution against the scope and is the only constructor of a `Proposal`.
+  `Proposal` has no `Deserialize` impl, so one cannot arrive from a config file
+  or an API payload either. "Framework residues are never mutated" is a
+  property of the types, not a convention a skill has to remember. Tooling in
+  this field disagrees about residue numbering, with 1-based per chain,
+  PDB-native with insertion codes, and contig strings all in use, and
+  off-by-one errors there are silent. This harness converts once, at the config
+  boundary, and the conversion has a test.
 - **One process, one language, no second runtime.** The dashboard is the same
-  binary as the runner; there is no Node or Python process beside it.
+  binary as the runner. There is no Node or Python process beside it.
 - **Cheap long-running processes.** A design run is mostly waiting on a GPU
   service. `tokio` makes bounded-concurrency folds and a tailable event log
-  straightforward, and the dashboard reads files rather than holding a socket, so
-  it cannot disturb a run.
+  straightforward, and the interfaces read files rather than holding a socket,
+  so neither can disturb a run.
 
-The cost is real: structure parsing, metrics and the models themselves live in
-Python's ecosystem. That is why they stay behind the contract. `pdbtbx` can read
+The cost is real. Structure parsing, metrics and the models themselves live in
+Python's ecosystem, which is why they stay behind the contract. `pdbtbx` reads
 mmCIF in Rust if a future adapter needs it.
 
 ## Install
 
 Needs a Rust toolchain at 1.82 or newer. If you have `rustup`, the pin in
-`rust-toolchain.toml` takes care of it; otherwise install Rust from
+`rust-toolchain.toml` takes care of it. Otherwise install Rust from
 [rustup.rs](https://rustup.rs).
 
 ```bash
@@ -62,16 +65,16 @@ cargo install --path . --locked      # puts `fh` in ~/.cargo/bin
 fh --version
 ```
 
-If `fh` is not found afterwards, `~/.cargo/bin` is not on your `PATH` — add it,
-or run `rustup update` which sets it up. To remove it later:
+If `fh` is not found afterwards, `~/.cargo/bin` is not on your `PATH`. Add it,
+or run `rustup update`, which sets it up. To remove `fh` later, run
 `cargo uninstall folding-harness`.
 
-Prefer not to install? `cargo build --release` and use
-`./target/release/fh` everywhere `fh` appears below.
+To skip installing, run `cargo build --release` and use `./target/release/fh`
+everywhere `fh` appears below.
 
 ## First run
 
-No GPU, no network, no API key: the default backend is a deterministic fixture.
+No GPU, no network, no API key. The default backend is a deterministic fixture.
 
 ```bash
 fh init                  # writes task.yaml, binder.fasta and target.fasta
@@ -80,11 +83,11 @@ fh run task.yaml         # run it, streaming events to stdout
 ```
 
 `fh init` writes the two FASTA files beside the config because `fh chat` and
-`fh task` take sequences as files or arguments. Both are placeholders — the
-target is synthetic, not a known protein — so replace them before doing
-anything real.
+`fh task` take sequences as files or arguments. Both are placeholders. The
+target is synthetic, not a known protein, so replace them before doing anything
+real.
 
-`fh validate` is worth reading before the first run — it prints the mutable
+Read the `fh validate` output before the first run. It prints the mutable
 scope, which is the thing most likely to be wrong, and the routing table, which
 says which design skills are available and why the others are not.
 
@@ -95,17 +98,17 @@ fh board                                  # dashboard on the most recent run
 fh run task.yaml --board --latency-ms 250 # or watch a run as it happens
 ```
 
-`--latency-ms` slows the fixture down so the cycles are visible; without it a
-14-cycle run finishes in under a second. In the dashboard: `1`–`5` or `Tab`
-switch panes, `j`/`k` select a candidate, `h`/`l`/`u`/`d` rotate the backbone,
-`+`/`-` zoom, `q` quits.
+`--latency-ms` slows the fixture down so the cycles are visible. Without it a
+14-cycle run finishes in under a second. Press `?` or `F1` in the dashboard for
+the key list.
 
 Other commands: `fh skills` lists the design skills and which are implemented,
-`fh ls` lists past runs, `fh doctor task.yaml` checks the setup and the backend.
+`fh ls` lists past runs, and `fh doctor task.yaml` checks the setup and the
+backend.
 
 ## Setting up a run by chatting
 
-`fh chat` is the conversational entry point: describe what you want, and the
+`fh chat` is the conversational entry point. You describe what you want, and the
 model turns it into a plan.
 
 ```bash
@@ -117,58 +120,59 @@ fh chat --binder binder.fasta --target target.fasta
 
 ```
 ┌─ conversation ───────────────────────────────┐┌─ plan ──────────────────────┐
-│ you:                                         ││ task        vhh-cdr-redesign │
+│ ▌ you                                        ││ task        vhh-cdr-redesign │
 │   design the three CDR loops, keep H:52,     ││ topology    vhh              │
 │   20 cycles                                  ││ chain H      115 residues    │
-│ model:                                       ││ chain A       65 residues    │
+│ ▌ model                                      ││ chain A       65 residues    │
 │   Three regions on H, H:52 pinned, gates     ││                              │
 │   permissive for a first run. {...}          ││ mutable     24 of 115 ...    │
-│ harness:                                     ││   loop1  residues 26..33     │
+│ ▌ harness                                    ││   loop1  residues 26..33     │
 │   Plan validated: 24 mutable of 115 binder   ││   loop2  residues 51..58     │
 │   residues across 3 regions. Ctrl-R to run.  ││   loop3  residues 99..108    │
 └──────────────────────────────────────────────┘│   fixed  91 cannot change    │
 ┌─ message ────────────────────────────────────┐│                              │
-│ ▮                                            ││ Ctrl-R to run                │
+│ > ▮                                          ││ Ctrl-R to run                │
 └──────────────────────────────────────────────┘└──────────────────────────────┘
-Enter send   Ctrl-R run   /help commands   PgUp/PgDn scroll   Esc quit
+Enter send   Ctrl-R run   F1 or /help for keys   PgUp/PgDn scroll   Esc quit
 ```
 
-Replies stream in as they are written. The message line is a real editor —
-Left/Right and Home/End move the cursor, Ctrl-W deletes a word, Ctrl-U clears
-the line, and Up/Down recall earlier messages. Slash commands (`/help`,
-`/plan`, `/run`, `/save [path]`, `/model`, `/clear`, `/quit`) are handled
-locally and never reach the model.
+Replies stream in as the model writes them. The message line is a real editor.
+Left and Right and Home and End move the cursor, Ctrl-W deletes a word, Ctrl-U
+clears the line, and Up and Down recall earlier messages. The slash commands
+`/help`, `/plan`, `/run`, `/save [path]`, `/model`, `/clear` and `/quit` run
+locally and never reach the model. `F1` prints the same list as `/help`.
 
-The pane on the right is **not the model's description of the plan** — it is what
-the typed config actually resolves to after the same validation a hand-written
-file gets. A hallucinated field fails `deny_unknown_fields`; a region past the
-end of a chain fails the scaffold check; a plan whose regions are all pinned
-fails as "nothing left to design". When a plan is rejected, the error goes back
-to the model so it can correct itself, and `Ctrl-R` does nothing until one
-validates. Nothing runs until you press it.
+The pane on the right is **not the model's description of the plan**. It is what
+the typed config resolves to after the same validation a hand-written file
+gets. A hallucinated field fails `deny_unknown_fields`. A region past the end of
+a chain fails the scaffold check. A plan whose regions are all pinned fails as
+"nothing left to design". When a plan is rejected, the error goes back to the
+model so it can correct itself, and `Ctrl-R` does nothing until one validates.
+Nothing runs until you press it.
 
 Two deliberate limits:
 
 - **The model is never asked for a sequence.** There is no sequence field in the
-  plan schema. Sequences come from `--binder` and `--target` (a FASTA path, or a
-  bare sequence on the command line). A model that guessed a target and had it
+  plan schema. Sequences come from `--binder` and `--target`, as a FASTA path or
+  a bare sequence on the command line. A model that guessed a target and had it
   folded would produce a confident, meaningless result.
-- **It proposes permissive gates for a first run**, because a gate above what the
-  starting sequence already scores admits nothing and leaves the search with no
-  ratchet. Tighten them once a run is clearing them.
+- **It proposes permissive gates for a first run.** A gate above what the
+  starting sequence already scores admits nothing, so the population never grows
+  past the founder and the search has nothing better to select. Tighten the
+  gates once a run is clearing them.
 
 `fh task "<prose>" --binder ... --target ...` is the same thing without the
-interface: it prints the plan, writes `task.yaml`, and with `--run` starts it
-after a confirmation.
+interface. It prints the plan, writes `task.yaml`, and with `--run` starts the
+run after a confirmation.
 
 ### A custom endpoint
 
-Any Messages-compatible endpoint works — a proxy, a gateway, a router, or
-something self-hosted:
+Any Messages-compatible endpoint works, including a proxy, a gateway, a router,
+or something self-hosted:
 
 ```bash
 export ANTHROPIC_API_KEY=...
-fh doctor --probe-model \
+fh doctor --probe-model --probe-stream \
   --url https://gateway.example.com \
   --model claude-opus-4-7 \
   --api-version 2023-06-01
@@ -176,43 +180,42 @@ fh doctor --probe-model \
 
 `--probe-model` sends one tiny request and prints what came back, so a wrong
 URL, key or model name is a one-line answer rather than a failure in the middle
-of a plan. Add `--probe-stream` to check the streaming path too, which is what
-`fh chat` uses — an endpoint can serve ordinary requests and not support
-server-sent events, and then `fh chat` will not work while `fh task` still
-will. Probe each model you intend to use: a gateway can serve one model
-happily and fail on another, including by declining a request that another
-model accepts. The same four flags work on `fh chat` and `fh task`, and
-`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` and `ANTHROPIC_API_VERSION` set them
-from the environment.
+of a plan. `--probe-stream` checks the streaming path, which is what `fh chat`
+uses. An endpoint can serve ordinary requests without supporting server-sent
+events, and then `fh chat` will not work while `fh task` still will.
+
+Probe each model you intend to use. A gateway can serve one model and fail on
+another, including by declining a request that another model accepts. The same
+flags work on `fh chat` and `fh task`, and `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_MODEL` and `ANTHROPIC_API_VERSION` set them from the environment.
 
 Two things change when the URL is not the first-party API:
 
-- **The request drops to the compatible subset** — `model`, `max_tokens`,
-  `system`, `messages`. Server-side refusal fallback and
-  `output_config.effort` are features of Anthropic's own API, and a gateway
-  that does not know a field may reject the whole request over it. Pass
-  `--effort high` to send it anyway if your endpoint supports it.
-- **The host is printed before any prompt is sent**, and flagged as
-  third-party. Prompts leave for that host, so whoever runs it can read them.
-  A gateway may also return its own errors as ordinary HTTP 200 replies, which
-  read as though the model said them — when a reply cannot be parsed, the
-  harness prints it verbatim and says which host it came from.
-  The harness only ever sends chain labels and lengths when drafting a plan,
-  never your sequences, but that is a property of this one code path rather
-  than a guarantee about anything you type into the chat.
+- **The request drops to the compatible subset.** It sends `model`,
+  `max_tokens`, `system` and `messages`. Server-side refusal fallback and
+  `output_config.effort` are features of Anthropic's own API, and a gateway that
+  does not know a field may reject the whole request over it. Pass
+  `--effort high` to send it anyway if your endpoint supports it, or
+  `--max-tokens` to lower the cap.
+- **The harness prints the host before it sends any prompt**, and flags it as
+  third-party. Prompts leave for that host, so whoever runs it can read them. A
+  gateway may also return its own errors as ordinary HTTP 200 replies, which
+  read as though the model said them. When a reply cannot be parsed, the harness
+  prints it verbatim and names the host it came from.
+
+When drafting a plan the harness sends chain labels and lengths, never your
+sequences. That holds for this one code path, and it is not a guarantee about
+anything you type into the chat.
 
 Keys belong in the environment, never in a task config or a committed file.
-
-The model only sees chain labels and lengths — not your sequences — when
-drafting a plan.
 
 ## Running against a service
 
 To exercise the real network path, run the stub service and point a task at it:
 
 ```bash
-./target/release/fh serve --task task.yaml --latency-ms 200
-./target/release/fh run task.yaml --url http://127.0.0.1:8080
+fh serve --task task.yaml --latency-ms 200
+fh run task.yaml --url http://127.0.0.1:8080
 ```
 
 The only difference between the two modes is whether the bytes crossed a socket.
@@ -247,13 +250,16 @@ The only difference between the two modes is whether the bytes crossed a socket.
                       (dedup, diversity, capacity)
 ```
 
-Two separations do the work. **Legality is not choice**: the router decides what
-may be used, from the user's enabled list, the capabilities the service
-advertises, whether an executor exists, and the search state; the agent only
-picks from that set, so it cannot reach a skill the service cannot serve. **Gates
-are not the loss**: the loss ranks candidates that are acceptable, gates decide
-what is acceptable at all, and a gate failure is recorded against the candidate
-rather than weighted away.
+Two separations carry the design.
+
+**Legality is not choice.** The router decides what may be used, from the
+user's enabled list, the capabilities the service advertises, whether an
+executor exists, and the search state. The agent only picks from that set, so
+it cannot reach a skill the service cannot serve.
+
+**Gates are not the loss.** The loss ranks candidates that are acceptable.
+Gates decide what is acceptable at all. A gate failure is recorded against the
+candidate rather than weighted away.
 
 ## What a run leaves behind
 
@@ -268,48 +274,53 @@ rather than weighted away.
 ```
 
 `run.json` is the part most pipelines leave implicit. With the seed, the config
-digest and the service version, a result can be re-run and shown to have used the
-same inputs. Set `FH_TASK_ROOT` to move the directory.
+digest and the service version, you can re-run a result and show that it used
+the same inputs. Set `FH_TASK_ROOT` to move the directory.
 
 ## The dashboard
 
-`fh board` has five panes: **Overview** (loss curve, per-cycle table, rejection
-counts, the last routing decision and why each skill was refused), **Population**
-(ranked table, loss broken down by term, the sequence with fixed residues grey,
-mutable green and changed yellow), **Lineage** (parent/child tree of retained
-candidates), **Structure** (below), and **Events** (the trace).
+`fh board` has five panes. **Overview** shows the loss curve, the per-cycle
+table, rejection counts, and the last routing decision with the reason each
+skill was refused. **Population** shows a ranked table, the loss broken down by
+term, and the sequence with fixed residues in grey, mutable in green and
+changed in yellow. **Lineage** shows a parent and child tree of the retained
+candidates. **Structure** is below. **Events** shows the trace.
+
+Press `?` or `F1` for the full key list, grouped, with the pane you are on
+marked. The short version: `q` quits, `1` to `5` and `Tab` switch panes, `j`
+and `k` select a candidate, and `f` follows the best one.
 
 ### The structure pane
 
-The predicted backbone, drawn with braille glyphs — 2×4 addressable dots per
-cell, so a modest pane holds a few hundred points. Alpha carbons are joined
-into a backbone and coloured by confidence band (blue, cyan, yellow, red for
-very high through very low; the fixed target in grey). `h`/`l` turn it, `u`/`d`
-tilt it, `+`/`-` zoom, `0` resets.
+The predicted backbone, drawn with braille glyphs. Each cell holds 2 by 4
+addressable dots, so a modest pane holds a few hundred points. The pane joins
+alpha carbons into a backbone and colours them by confidence band, with blue,
+cyan, yellow and red for very high through very low, and the fixed target in
+grey. `h` and `l` turn it, `u` and `d` tilt it, `+` and `-` zoom, and `0`
+resets.
 
-The projection is orthographic, and the canvas bounds are corrected for the
-braille dot aspect so the shape is not stretched sideways — a braille cell is
-2 dots wide and 4 tall, so equal world distances need unequal world *ranges*
-on the two axes.
+The projection is orthographic. The canvas bounds correct for the braille dot
+aspect so the shape is not stretched sideways, because a cell is 2 dots wide
+and 4 tall, so equal world distances need unequal world *ranges* on the two
+axes.
 
-To see a pane without taking over the terminal — over a pipe, in a note, or in
-CI — render one frame as text:
+To see a pane without taking over the terminal, over a pipe, in a note, or in
+CI, render one frame as text:
 
 ```bash
 fh board --snapshot --pane structure --width 100 --height 32
 fh board --snapshot --pane structure --view 0.8,1.2    # yaw,pitch in radians
 fh board --snapshot --pane overview --path <task dir>
+fh board --snapshot --keys                             # print the key list
 ```
 
-Colour carries the confidence bands in the live pane and is dropped in a
-snapshot; the braille still carries the shape.
-
-Keys: `q` quit, `1`–`5`/`Tab` panes, `j/k` select, `f` follow the best candidate.
+Colour carries the confidence bands in the live pane and a snapshot drops it.
+The braille still carries the shape.
 
 ## The compute contract
 
-`fh-contract` is the whole protocol and depends only on `serde`, so a service can
-implement it without the rest of the harness:
+`src/contract.rs` is the whole protocol and depends only on `serde`, so a
+service can implement it without the rest of the harness:
 
 ```
 GET  /v1/health          -> Health   { protocol, capabilities, gpus, queue_depth }
@@ -317,22 +328,22 @@ POST /v1/fold            -> JobAccepted { job_id }      (returns immediately)
 GET  /v1/fold/{job_id}   -> JobStatus   { state, result }
 ```
 
-Submission is accept-then-poll, not a long blocking request: a fold outlives the
-client, a crashed client can reattach to a job id, and the service can report a
-queue. `fh-fold::server` is a working reference implementation.
+Submission is accept-then-poll rather than one long blocking request. A fold
+outlives the client, a crashed client can reattach to a job id, and the service
+can report a queue. `src/fold/server.rs` is a working reference implementation.
 
-Capabilities drive the router: a service that advertises only `fold` will never
+Capabilities drive the router. A service that advertises only `fold` will never
 be offered an inverse-folding skill.
 
 ## Layout
 
-One crate, `src/`, layered bottom up. Everything is Rust; there is no Python,
+One crate, `src/`, layered bottom up. Everything is Rust. There is no Python,
 no Node, and no second runtime.
 
 | path | holds |
 | --- | --- |
 | `src/ids.rs` | newtype identifiers, so a chain index cannot be passed as a candidate id |
-| `src/scaffold.rs` | chains, regions, pinned residues, and `MutableScope` — **the invariant lives here** |
+| `src/scaffold.rs` | chains, regions, pinned residues, and `MutableScope`, where the invariant lives |
 | `src/proposal.rs` | `SkillId`, `Capability`, and the validated `Proposal` |
 | `src/candidate.rs` | a candidate and where it came from |
 | `src/metrics.rs` | metrics, loss weights, the weighted loss and its breakdown |
@@ -344,49 +355,52 @@ no Node, and no second runtime.
 | `src/fold/` | `FoldBackend` trait, `fixture.rs`, `http.rs`, `server.rs` |
 | `src/skills/` | design skills and `router.rs` |
 | `src/agent.rs` | the decision layer and the `ModelProvider` trait |
-| `src/provider.rs` | the Claude Messages API over raw HTTP |
+| `src/provider.rs` | the Claude Messages API over raw HTTP, with streaming |
 | `src/plan.rs` | prose to a validated task config |
 | `src/fasta.rs` | a minimal FASTA reader |
 | `src/trace.rs` | event log, task directory layout, run manifest |
 | `src/orchestrator.rs` | the cycle |
-| `src/tui/` | the dashboard, `chat.rs`, and `structure.rs` (the backbone projection) |
+| `src/tui/` | the dashboard, `chat.rs`, and `structure.rs` for the backbone projection |
 | `src/main.rs` | the `fh` command |
 | `src/tests.rs` | tests for the domain layer |
 
 The layering is a convention here rather than something the compiler enforces,
-so `CLAUDE.md` states it: `scaffold`/`proposal`/`candidate`/`metrics`/`gate`/
-`population`/`search`/`config` do no I/O, `contract` depends only on `serde`,
-and nothing below `orchestrator` reaches upward.
+so `CLAUDE.md` states it. The modules `scaffold`, `proposal`, `candidate`,
+`metrics`, `gate`, `population`, `search` and `config` do no I/O, `contract`
+depends only on `serde`, and nothing below `orchestrator` reaches upward.
 
 ## Roadmap
 
-Nearest first:
+Nearest first.
 
-1. **A real backend adapter.** Boltz-2 (MIT) and Chai-1 (Apache-2.0) ship code
-   *and* weights openly, which makes them the practical first targets; both are
-   CLI-only, so the adapter is a thin service wrapping a CLI behind
-   `src/contract.rs`. `RosettaCommons/foundry` is also worth a look — BSD-3
-   covering code *and* weights, one install for RFD3, RoseTTAFold3 and
-   ProteinMPNN/LigandMPNN. Tamarind Bio exposes a hosted REST API with a real
-   job queue if you would rather not run GPUs. AlphaFold 3's code is Apache-2.0
-   but its weights are non-commercial, must not be redistributed (including
-   derived weights), and may not be used to train competing predictors — read
-   `WEIGHTS_TERMS_OF_USE.md` before wiring it up, and note that AlphaFold Server
-   has no API.
-   Licensing is not uniform even within one repo: some projects' LICENSE covers
-   weights explicitly, some are silent, and some put weights under a separate
-   agreement. Record which, per backend, in its adapter.
+1. **A real backend adapter.** Boltz-2 under MIT and Chai-1 under Apache-2.0
+   ship code *and* weights openly, which makes them the practical first
+   targets. Both are CLI-only, so the adapter is a thin service wrapping a CLI
+   behind `src/contract.rs`. `RosettaCommons/foundry` is also worth a look,
+   since its BSD-3 licence covers code and weights and one install gives RFD3,
+   RoseTTAFold3 and ProteinMPNN with LigandMPNN. Tamarind Bio exposes a hosted
+   REST API with a real job queue if you would rather not run GPUs. AlphaFold
+   3's code is Apache-2.0 but its weights are non-commercial, must not be
+   redistributed including derived weights, and may not be used to train
+   competing predictors. Read `WEIGHTS_TERMS_OF_USE.md` before wiring it up,
+   and note that AlphaFold Server has no API.
+   Licensing is not uniform even within one repository. Some projects' LICENSE
+   covers weights explicitly, some are silent, and some put weights under a
+   separate agreement. Record which, per backend, in its adapter.
 2. **Output re-verification.** Check the returned structure's sequence against
    the proposal, so a backend that silently renumbers or substitutes is caught
    rather than scored.
 3. **Inverse-folding and likelihood-guided executors**, behind the capabilities
    the router already checks.
-4. **Resume.** The trace and manifest are sufficient to rebuild a population and
-   continue; `TraceWriter::append` exists for it.
-5. **An MCP server.** `rmcp` is the official Rust SDK, and MCP's Tasks extension
-   is a close match for this job contract — that is how the harness gets driven
-   by an agent instead of only driving one.
-6. **Cost accounting.** GPU-seconds and token spend per run, which the open
+4. **Resume.** The trace and manifest are enough to rebuild a population and
+   continue. `TraceWriter::append` exists for it.
+5. **Prompt caching in the chat screen.** A long conversation resends its whole
+   history each turn. Caching the system prompt would cut that, and it only
+   works against the first-party API.
+6. **An MCP server.** `rmcp` is the official Rust SDK, and MCP's Tasks
+   extension is a close match for this job contract. That is how the harness
+   gets driven by an agent instead of only driving one.
+7. **Cost accounting.** GPU-seconds and token spend per run, which the open
    harnesses in this space generally do not surface.
 
 ## Licence

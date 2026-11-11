@@ -32,8 +32,8 @@ use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine, Points};
 use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, List, ListItem, Paragraph, Row, Table,
-    TableState, Tabs, Wrap,
+    Axis, Block, Borders, Chart, Clear, Dataset, Gauge, GraphType, List, ListItem, Paragraph, Row,
+    Table, TableState, Tabs, Wrap,
 };
 use ratatui::{Frame, Terminal};
 
@@ -119,6 +119,7 @@ pub struct App {
     event_scroll: Option<usize>,
     follow_best: bool,
     status: String,
+    show_help: bool,
     should_quit: bool,
 }
 
@@ -142,6 +143,7 @@ impl App {
             event_scroll: None,
             follow_best: true,
             status: String::new(),
+            show_help: false,
             should_quit: false,
         }
     }
@@ -227,7 +229,22 @@ impl App {
             return;
         }
 
+        // While the overlay is up it swallows the keys that would otherwise
+        // quit or move the selection, so a glance at the help cannot end the
+        // session by accident.
+        if self.show_help {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::F(1) | KeyCode::Esc | KeyCode::Enter => {
+                    self.show_help = false
+                }
+                KeyCode::Char('q') => self.should_quit = true,
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
+            KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Tab => self.tab = self.tab.next(),
             KeyCode::BackTab => self.tab = self.tab.previous(),
@@ -306,6 +323,101 @@ impl App {
             Tab::Events => self.draw_events(frame, rows[2]),
         }
         self.draw_footer(frame, rows[3]);
+
+        if self.show_help {
+            self.draw_help(frame, area);
+        }
+    }
+
+    /// A centred box of the given size, clamped to the area.
+    fn centred(area: Rect, width: u16, height: u16) -> Rect {
+        let width = width.min(area.width);
+        let height = height.min(area.height);
+        Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        }
+    }
+
+    /// Every key, grouped, with the current pane's group marked.
+    ///
+    /// The footer only has room for a handful, and a key you have to remember
+    /// is a key you will not use.
+    fn draw_help(&self, frame: &mut Frame, area: Rect) {
+        let mut lines: Vec<Line> = Vec::new();
+        let heading = |text: &str, active: bool| {
+            Line::from(Span::styled(
+                if active {
+                    format!("{text}  (this pane)")
+                } else {
+                    text.to_string()
+                },
+                Style::default()
+                    .fg(if active { Color::Cyan } else { Color::DarkGray })
+                    .add_modifier(Modifier::BOLD),
+            ))
+        };
+        let key = |keys: &str, what: &str| {
+            Line::from(vec![
+                Span::styled(format!("  {keys:<22}"), Style::default().fg(Color::White)),
+                Span::styled(what.to_string(), Style::default().fg(Color::Gray)),
+            ])
+        };
+
+        lines.push(heading("panes", false));
+        lines.push(key("1 2 3 4 5", "jump to a pane"));
+        lines.push(key("Tab / Shift-Tab", "next / previous pane"));
+        lines.push(Line::from(""));
+
+        lines.push(heading(
+            "candidates",
+            matches!(self.tab, Tab::Overview | Tab::Population | Tab::Lineage),
+        ));
+        lines.push(key("j / Down", "next candidate"));
+        lines.push(key("k / Up", "previous candidate"));
+        lines.push(key("f", "follow the best candidate"));
+        lines.push(Line::from(""));
+
+        lines.push(heading("structure", matches!(self.tab, Tab::Structure)));
+        lines.push(key("h / l", "turn left / right"));
+        lines.push(key("u / d", "tilt up / down"));
+        lines.push(key("+ / -", "zoom in / out"));
+        lines.push(key("0", "reset the view"));
+        lines.push(Line::from(""));
+
+        lines.push(heading("events", matches!(self.tab, Tab::Events)));
+        lines.push(key("j / k", "scroll one line"));
+        lines.push(key("PgUp / PgDn", "scroll a page"));
+        lines.push(key("End", "follow new events again"));
+        lines.push(Line::from(""));
+
+        lines.push(heading("session", false));
+        lines.push(key("? / F1", "open or close this help"));
+        lines.push(key("q / Esc / Ctrl-C", "quit the dashboard"));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Quitting does not stop the run.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Reopen this view with `fh board`.",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let height = lines.len() as u16 + 2;
+        let popup = Self::centred(area, 62, height);
+
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" keys — ? or Esc to close "),
+            ),
+            popup,
+        );
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
@@ -978,7 +1090,7 @@ impl App {
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(
                 "no candidates yet",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             )));
         }
 
@@ -1018,7 +1130,7 @@ impl App {
                     "no stored backbone for {}\n\nthe service returned no alpha-carbon trace for this candidate",
                     candidate.id
                 ))
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(Color::Gray))
                 .wrap(Wrap { trim: true })
                 .block(Block::default().borders(Borders::ALL).title(" structure ")),
                 area,
@@ -1150,7 +1262,7 @@ impl App {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "a synthetic backbone when the fixture backend produced it",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
 
         frame.render_widget(
@@ -1211,12 +1323,12 @@ impl App {
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let keys = match self.tab {
             Tab::Structure => {
-                "q quit  1-5/Tab panes  j/k select  h/l/u/d rotate  +/- zoom  0 reset"
+                "? help   q quit   1-5/Tab panes   j/k select   h/l/u/d rotate   +/- zoom   0 reset"
             }
-            Tab::Events => "q quit  1-5/Tab panes  j/k scroll  PgUp/PgDn page  End follow",
-            _ => "q quit  1-5/Tab panes  j/k select  f follow-best",
+            Tab::Events => "? help   q quit   1-5/Tab panes   j/k scroll   PgUp/PgDn page",
+            _ => "? help   q quit   1-5/Tab panes   j/k select   f follow-best",
         };
-        let mut spans = vec![Span::styled(keys, Style::default().fg(Color::DarkGray))];
+        let mut spans = vec![Span::styled(keys, Style::default().fg(Color::Gray))];
         if !self.status.is_empty() {
             spans.push(Span::raw("  |  "));
             spans.push(Span::styled(
@@ -1242,6 +1354,7 @@ pub fn snapshot(
     width: u16,
     height: u16,
     camera: Option<Camera>,
+    keys: bool,
 ) -> io::Result<String> {
     use ratatui::backend::TestBackend;
 
@@ -1251,6 +1364,7 @@ pub fn snapshot(
     if let Some(camera) = camera {
         app.camera = camera;
     }
+    app.show_help = keys;
 
     let mut terminal = Terminal::new(TestBackend::new(width.max(40), height.max(12)))?;
     terminal.draw(|frame| app.draw(frame))?;
@@ -1339,6 +1453,78 @@ mod tests {
         assert_eq!(Tab::Overview.previous(), Tab::Events);
         assert_eq!(Tab::Overview.index(), 0);
         assert_eq!(Tab::Events.index(), 4);
+    }
+
+    #[test]
+    fn the_help_overlay_opens_and_does_not_quit_by_accident() {
+        let dir = std::env::temp_dir().join(format!("fh-tui-help-{}", crate::trace::now_ms()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut app = App::new(TaskPaths::new(&dir));
+
+        assert!(!app.show_help);
+        app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(app.show_help);
+
+        // While it is open, keys that would normally move or quit are
+        // swallowed — except `q`, which still means quit.
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.tab, Tab::Overview, "the pane must not change");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.show_help, "Esc closes the help");
+        assert!(!app.should_quit(), "Esc must not also quit");
+
+        app.on_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(app.show_help);
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.should_quit());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_help_overlay_renders_over_every_pane_at_any_size() {
+        use ratatui::backend::TestBackend;
+
+        let dir = std::env::temp_dir().join(format!("fh-tui-helpdraw-{}", crate::trace::now_ms()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut app = App::new(TaskPaths::new(&dir));
+        app.show_help = true;
+
+        for (width, height) in [(140, 44), (100, 30), (40, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            for tab in Tab::ALL {
+                app.tab = tab;
+                terminal
+                    .draw(|frame| app.draw(frame))
+                    .unwrap_or_else(|error| panic!("{tab:?} at {width}x{height}: {error}"));
+            }
+        }
+
+        // The overlay names the keys, and marks the pane you are on.
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+        app.tab = Tab::Structure;
+        terminal.draw(|frame| app.draw(frame)).expect("renders");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("zoom in / out"), "keys missing");
+        assert!(text.contains("this pane"), "the active group is not marked");
+        // Nothing in the overlay may be clipped by its own border: every
+        // entry has to fit the inner width.
+        assert!(
+            text.contains("follow the best candidate"),
+            "a description was cut off"
+        );
+        assert!(
+            text.contains("Reopen this view with `fh board`."),
+            "the closing note was cut off"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

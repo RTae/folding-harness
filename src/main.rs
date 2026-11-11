@@ -163,6 +163,9 @@ enum Command {
         /// Rotate the structure view before rendering: yaw,pitch in radians.
         #[arg(long)]
         view: Option<String>,
+        /// Draw the key list over the pane. With --snapshot, prints it.
+        #[arg(long)]
+        keys: bool,
     },
     /// Serve a stub compute service speaking the fold contract.
     Serve {
@@ -264,6 +267,7 @@ async fn main() -> Result<()> {
             width,
             height,
             view,
+            keys,
         } => board(
             path,
             task,
@@ -273,6 +277,7 @@ async fn main() -> Result<()> {
             width,
             height,
             view,
+            keys,
         ),
         Command::Serve {
             port,
@@ -760,6 +765,7 @@ fn board(
     width: u16,
     height: u16,
     view: Option<String>,
+    keys: bool,
 ) -> Result<()> {
     let paths = resolve_task_dir(path, task)?;
     if !paths.root().exists() {
@@ -797,7 +803,7 @@ fn board(
         };
 
     let text =
-        fh::tui::snapshot(paths, tab, width, height, camera).context("rendering the pane")?;
+        fh::tui::snapshot(paths, tab, width, height, camera, keys).context("rendering the pane")?;
     print!("{text}");
     Ok(())
 }

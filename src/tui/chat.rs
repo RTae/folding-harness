@@ -88,15 +88,27 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
             out.push(String::new());
             continue;
         }
+
+        // Keep the line's own indentation and repeat it on continuations, so
+        // nested JSON stays readable instead of collapsing to a flat block.
+        let body = paragraph.trim_start();
+        let depth = paragraph.chars().count() - body.chars().count();
+        let indent = " ".repeat(depth.min(width.saturating_sub(8)));
+        let width = width - indent.chars().count();
+
         let mut line = String::new();
-        for word in paragraph.split_whitespace() {
+        let push = |line: String, out: &mut Vec<String>| {
+            out.push(format!("{indent}{line}"));
+        };
+
+        for word in body.split_whitespace() {
             if line.is_empty() {
                 // A single word longer than the pane is hard-split.
                 if word.chars().count() > width {
                     let mut rest = word;
                     while rest.chars().count() > width {
                         let head: String = rest.chars().take(width).collect();
-                        out.push(head);
+                        push(head, &mut out);
                         rest = &rest[rest
                             .char_indices()
                             .nth(width)
@@ -111,12 +123,12 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
                 line.push(' ');
                 line.push_str(word);
             } else {
-                out.push(std::mem::take(&mut line));
+                push(std::mem::take(&mut line), &mut out);
                 line.push_str(word);
             }
         }
         if !line.is_empty() {
-            out.push(line);
+            push(line, &mut out);
         }
     }
     out
@@ -524,9 +536,29 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
                     self.follow = true;
                 }
                 Ok(Incoming::Failed(detail)) => {
+                    // Text that already arrived is worth keeping: a stream cut
+                    // off at the end may still carry a complete plan, and
+                    // throwing it away would waste the whole turn.
+                    let partial = self
+                        .streaming_into
+                        .and_then(|index| self.transcript.get(index))
+                        .map(|(_, text)| text.clone())
+                        .filter(|text| !text.trim().is_empty());
+
                     self.drop_empty_stream_entry();
                     self.finish_streaming();
-                    self.note(format!("the model call failed: {detail}"));
+
+                    match partial {
+                        None => self.note(format!("the model call failed: {detail}")),
+                        Some(text) => {
+                            self.note(format!(
+                                "the reply stopped early: {detail}\nWhat arrived is above, and \
+is checked below in case it was already complete."
+                            ));
+                            self.history.push(ChatMessage::assistant(text.clone()));
+                            self.validate(&text);
+                        }
+                    }
                     return;
                 }
                 Ok(Incoming::Done(reply)) => {
@@ -648,6 +680,9 @@ task.yaml, or keep talking to change it."
 
         match key.code {
             KeyCode::Esc => self.quit = true,
+            // `?` is a character you might want to type, so the shortcut is
+            // F1; /help does the same thing.
+            KeyCode::F(1) => self.note(HELP),
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
@@ -744,7 +779,7 @@ task.yaml, or keep talking to change it."
                         "thinking".to_string()
                     }
                 ),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             )));
         }
 
@@ -787,7 +822,7 @@ task.yaml, or keep talking to change it."
         let (text, style) = if busy && self.input.is_empty() {
             (
                 "waiting for the model…".to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             )
         } else {
             (shown, Style::default().fg(Color::White))
@@ -810,8 +845,8 @@ task.yaml, or keep talking to change it."
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let mut spans = vec![Span::styled(
-            "Enter send   Ctrl-R run   /help commands   PgUp/PgDn scroll   Esc quit",
-            Style::default().fg(Color::DarkGray),
+            "Enter send   Ctrl-R run   F1 or /help for keys   PgUp/PgDn scroll   Esc quit",
+            Style::default().fg(Color::Gray),
         )];
         if !self.status.is_empty() {
             spans.push(Span::raw("  |  "));
@@ -863,7 +898,9 @@ task.yaml, or keep talking to change it."
             (None, None) => {
                 lines.push(Line::from(Span::styled(
                     "no plan yet",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::from(""));
                 for wrapped in wrap(
@@ -874,13 +911,13 @@ and how long to search. Example: \"design the three CDR loops of this VHH, keep 
                 ) {
                     lines.push(Line::from(Span::styled(
                         wrapped,
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     )));
                 }
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "chains supplied",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Cyan),
                 )));
                 for chain in &self.binder {
                     lines.push(Line::from(format!(
@@ -1026,6 +1063,78 @@ mod tests {
             "{long:?}"
         );
         assert_eq!(long.concat(), "QVQLVESGGGLVQAGGSLRLSCAAS");
+    }
+
+    #[test]
+    fn wrapping_keeps_each_line_s_own_indentation() {
+        // JSON in a reply is only readable if nesting survives the wrap.
+        let json = "{\n  \"regions\": [\n    {\"name\": \"cdr1\"}\n  ]\n}";
+        let lines = wrap(json, 40);
+        assert_eq!(lines[0], "{");
+        assert_eq!(lines[1], "  \"regions\": [");
+        assert_eq!(lines[2], "    {\"name\": \"cdr1\"}");
+        assert_eq!(lines[3], "  ]");
+        assert_eq!(lines[4], "}");
+
+        // A continuation of an indented line keeps the same indentation.
+        let long = "    aaa bbb ccc ddd eee fff ggg hhh";
+        let wrapped = wrap(long, 20);
+        assert!(wrapped.len() > 1, "{wrapped:?}");
+        assert!(
+            wrapped.iter().all(|line| line.starts_with("    ")),
+            "{wrapped:?}"
+        );
+        assert!(
+            wrapped.iter().all(|line| line.chars().count() <= 20),
+            "{wrapped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_cut_off_at_the_end_is_kept_and_still_checked() {
+        let mut app = app_with("");
+        let (tx, rx) = mpsc::channel();
+        app.waiting = Some(rx);
+        app.transcript.push((Entry::Model, String::new()));
+        app.streaming_into = Some(app.transcript.len() - 1);
+
+        // A complete plan arrives, then the stream reports a refusal.
+        tx.send(Incoming::Delta(GOOD_PLAN.to_string())).unwrap();
+        tx.send(Incoming::Failed(
+            "the model declined this request (no category given)".to_string(),
+        ))
+        .unwrap();
+        app.poll_worker();
+
+        // The text is not thrown away, and it was validated anyway.
+        assert!(app
+            .transcript
+            .iter()
+            .any(|(entry, text)| *entry == Entry::Model && text.contains("vhh")));
+        assert!(
+            app.plan.is_some(),
+            "a complete plan must survive a late refusal"
+        );
+        assert_eq!(app.history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_fails_with_nothing_said_is_just_an_error() {
+        let mut app = app_with("");
+        let (tx, rx) = mpsc::channel();
+        app.waiting = Some(rx);
+        app.transcript.push((Entry::Model, String::new()));
+        app.streaming_into = Some(app.transcript.len() - 1);
+
+        tx.send(Incoming::Failed("connection reset".to_string()))
+            .unwrap();
+        app.poll_worker();
+
+        assert!(app.plan.is_none());
+        assert!(app.history.is_empty(), "nothing was said, nothing to keep");
+        let (entry, text) = app.transcript.last().expect("a note");
+        assert_eq!(*entry, Entry::Harness);
+        assert!(text.contains("connection reset"), "{text}");
     }
 
     #[test]
