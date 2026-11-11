@@ -213,6 +213,12 @@ impl ChatMessage {
 pub trait ModelProvider: Send + Sync {
     fn model(&self) -> &str;
 
+    /// Host this provider talks to, for the record of a session. Empty when
+    /// the provider has no meaningful endpoint.
+    fn endpoint(&self) -> &str {
+        ""
+    }
+
     async fn complete(&self, system: &str, user: &str) -> Result<String, AgentError>;
 
     /// Multi-turn conversation, streaming the reply as it is generated.

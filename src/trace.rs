@@ -415,6 +415,9 @@ pub struct RunManifest {
     pub folds: usize,
     pub best_candidate: Option<CandidateId>,
     pub best_loss: Option<f64>,
+    /// The chat this run was started from, when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {

@@ -99,11 +99,18 @@ enum Command {
     /// Chat with a model to set up a run, see the validated plan, then confirm.
     Chat {
         /// Binder chain: a FASTA path, or a bare sequence. Repeatable.
-        #[arg(long, required = true)]
+        /// Not needed when resuming, which reuses the stored sequences.
+        #[arg(long)]
         binder: Vec<String>,
         /// Target chain: a FASTA path, or a bare sequence. Repeatable.
-        #[arg(long, required = true)]
+        #[arg(long)]
         target: Vec<String>,
+        /// Carry on a stored chat by id. See `fh chats`.
+        #[arg(long)]
+        resume: Option<String>,
+        /// Carry on the most recent chat.
+        #[arg(long, name = "continue")]
+        continue_last: bool,
         #[arg(long, default_value_t = 20261111)]
         seed: u64,
         #[command(flatten)]
@@ -167,6 +174,14 @@ enum Command {
         #[arg(long)]
         keys: bool,
     },
+    /// Serve the browser view of recorded runs on localhost.
+    Web {
+        #[arg(long, default_value_t = 8750)]
+        port: u16,
+        /// Task root to read. Defaults to $FH_TASK_ROOT or ~/.folding_harness/tasks.
+        #[arg(long)]
+        task_root: Option<PathBuf>,
+    },
     /// Serve a stub compute service speaking the fold contract.
     Serve {
         #[arg(long, default_value_t = 8080)]
@@ -196,6 +211,12 @@ enum Command {
     Skills,
     /// List recorded runs.
     Ls,
+    /// List saved chats.
+    Chats {
+        /// Print the whole transcript of one chat.
+        #[arg(long)]
+        show: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -227,6 +248,8 @@ async fn main() -> Result<()> {
         Command::Chat {
             binder,
             target,
+            resume,
+            continue_last,
             seed,
             provider,
             task_root,
@@ -235,6 +258,8 @@ async fn main() -> Result<()> {
             chat(
                 binder,
                 target,
+                resume,
+                continue_last,
                 seed,
                 provider,
                 task_root,
@@ -279,6 +304,7 @@ async fn main() -> Result<()> {
             view,
             keys,
         ),
+        Command::Web { port, task_root } => web(port, task_root).await,
         Command::Serve {
             port,
             task,
@@ -295,6 +321,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Ls => list_runs(),
+        Command::Chats { show } => list_chats(show),
     }
 }
 
@@ -469,7 +496,7 @@ async fn run(
         config.fold.execution_mode = ExecutionMode::Service;
     }
 
-    run_config(config, task_root, open_board, latency).await
+    run_config(config, task_root, open_board, latency, None).await
 }
 
 /// Prepare and run an already-resolved config. Shared by `fh run`, `fh task`
@@ -479,6 +506,7 @@ async fn run_config(
     task_root: Option<PathBuf>,
     open_board: bool,
     latency: Duration,
+    chat_id: Option<String>,
 ) -> Result<()> {
     let (scaffold, scope) = config.resolve().context("resolving the scaffold")?;
     let backend = backend_for(&config, &scaffold, &scope, latency)?;
@@ -501,7 +529,17 @@ async fn run_config(
         task_id.clone(),
     )
     .await
-    .context("preparing the run")?;
+    .context("preparing the run")?
+    .attributed_to(chat_id.clone())
+    .context("recording the chat this run came from")?;
+
+    // Both directions of the link, so either record finds the other.
+    if let Some(chat_id) = &chat_id {
+        let root = fh::history::chat_root();
+        if let Err(error) = fh::history::record_run(&root, chat_id, &task_id.0) {
+            println!("note: could not link this run to chat {chat_id}: {error}");
+        }
+    }
 
     if open_board {
         // stdout belongs to the dashboard, so no event sink here.
@@ -650,16 +688,54 @@ fn confirm(question: &str) -> Result<bool> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn chat(
     binder: Vec<String>,
     target: Vec<String>,
+    resume: Option<String>,
+    continue_last: bool,
     seed: u64,
     options: ProviderOptions,
     task_root: Option<PathBuf>,
     latency: Duration,
 ) -> Result<()> {
-    let binder_chains = load_chains(&binder, "H")?;
-    let target_chains = load_chains(&target, "A")?;
+    let chat_root = fh::history::chat_root();
+
+    // Resuming brings its own sequences, so `--binder` and `--target` are only
+    // required for a fresh chat.
+    let record = if continue_last || resume.is_some() {
+        let loaded =
+            fh::history::load(&chat_root, resume.as_deref()).with_context(|| match &resume {
+                Some(id) => format!("loading chat {id}"),
+                None => "loading the most recent chat".to_string(),
+            })?;
+        println!(
+            "resuming chat {} from {} ({} message(s))",
+            loaded.id,
+            fh::history::ago(loaded.updated_at_ms),
+            loaded.messages.len()
+        );
+        Some(loaded)
+    } else {
+        None
+    };
+
+    let (binder_chains, target_chains) = match &record {
+        Some(loaded) if binder.is_empty() && target.is_empty() => {
+            (loaded.binder_chains(), loaded.target_chains())
+        }
+        _ => {
+            if binder.is_empty() || target.is_empty() {
+                return Err(anyhow!(
+                    "a new chat needs --binder and --target (a FASTA path or a sequence).\n\
+                     `fh init` writes example binder.fasta and target.fasta.\n\
+                     To carry on an earlier chat instead, use --continue or --resume <id>."
+                ));
+            }
+            (load_chains(&binder, "H")?, load_chains(&target, "A")?)
+        }
+    };
+
     let built = make_provider(&options)?;
     println!("model {}", built.describe());
     let provider: Arc<dyn ModelProvider> = Arc::new(built);
@@ -668,7 +744,14 @@ async fn chat(
     // the model call while the interface keeps drawing.
     let runtime = tokio::runtime::Handle::current();
     let confirmed = tokio::task::spawn_blocking(move || {
-        fh::tui::chat::run(provider, runtime, binder_chains, target_chains, seed)
+        fh::tui::chat::run(
+            provider,
+            runtime,
+            binder_chains,
+            target_chains,
+            seed,
+            record,
+        )
     })
     .await
     .context("chat thread")?
@@ -677,13 +760,77 @@ async fn chat(
     match confirmed {
         None => {
             println!("no plan confirmed; nothing ran");
+            println!("the conversation is saved: fh chats");
             Ok(())
         }
-        Some(config) => {
+        Some((config, chat_id)) => {
             println!("running the confirmed plan: {}", config.name);
-            run_config(config, task_root, true, latency).await
+            run_config(config, task_root, true, latency, Some(chat_id)).await
         }
     }
+}
+
+fn list_chats(show: Option<String>) -> Result<()> {
+    let root = fh::history::chat_root();
+
+    if let Some(id) = show {
+        let record =
+            fh::history::load(&root, Some(&id)).with_context(|| format!("loading chat {id}"))?;
+        println!(
+            "chat {}  {}  model {}{}",
+            record.id,
+            fh::history::ago(record.updated_at_ms),
+            record.model,
+            if record.endpoint.is_empty() {
+                String::new()
+            } else {
+                format!(" via {}", record.endpoint)
+            }
+        );
+        if !record.task_ids.is_empty() {
+            println!("runs {}", record.task_ids.join(", "));
+        }
+        println!();
+        for message in &record.messages {
+            let who = match message.role {
+                fh::history::StoredRole::User => "you",
+                fh::history::StoredRole::Assistant => "model",
+            };
+            println!("{who}:");
+            for line in message.text.lines() {
+                println!("  {line}");
+            }
+            println!();
+        }
+        return Ok(());
+    }
+
+    let chats = fh::history::list(&root).with_context(|| format!("listing {}", root.display()))?;
+    if chats.is_empty() {
+        println!("no saved chats under {}", root.display());
+        println!("start one with: fh chat --binder binder.fasta --target target.fasta");
+        return Ok(());
+    }
+
+    println!(
+        "{:<16} {:<10} {:<22} {:>5} {:>5}  plan",
+        "id", "when", "model", "turns", "runs"
+    );
+    for record in chats.iter().take(40) {
+        println!(
+            "{:<16} {:<10} {:<22} {:>5} {:>5}  {}",
+            record.id,
+            fh::history::ago(record.updated_at_ms),
+            record.model.chars().take(22).collect::<String>(),
+            record.user_turns(),
+            record.task_ids.len(),
+            record.plan_name.clone().unwrap_or_default()
+        );
+    }
+    println!();
+    println!("fh chats --show <id>        print a transcript");
+    println!("fh chat --resume <id>       carry one on");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -735,7 +882,7 @@ async fn task_from_prose(
         return Ok(());
     }
 
-    run_config(plan.config, task_root, false, Duration::ZERO).await
+    run_config(plan.config, task_root, false, Duration::ZERO, None).await
 }
 
 fn resolve_task_dir(path: Option<PathBuf>, task: Option<String>) -> Result<TaskPaths> {
@@ -806,6 +953,31 @@ fn board(
         fh::tui::snapshot(paths, tab, width, height, camera, keys).context("rendering the pane")?;
     print!("{text}");
     Ok(())
+}
+
+async fn web(port: u16, task_root: Option<PathBuf>) -> Result<()> {
+    let root = task_root.unwrap_or_else(TaskPaths::default_root);
+    let runs = TaskPaths::list(&root).unwrap_or_default();
+
+    // Loopback only: this serves local run data and authenticates nobody.
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    println!("reading {}", root.display());
+    println!(
+        "{} run(s) found{}",
+        runs.len(),
+        if runs.is_empty() {
+            "; start one with `fh run task.yaml`"
+        } else {
+            ""
+        }
+    );
+    println!();
+    println!("open http://{addr}");
+    println!("ctrl-c to stop");
+
+    fh::web::serve(addr, root)
+        .await
+        .map_err(|error| anyhow!("serving: {error}"))
 }
 
 async fn serve(port: u16, task: Option<PathBuf>, latency: Duration) -> Result<()> {

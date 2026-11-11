@@ -132,6 +132,7 @@ impl Orchestrator {
             folds: 0,
             best_candidate: None,
             best_loss: None,
+            chat_id: None,
         };
         crate::trace::write_json(paths.manifest(), &manifest)?;
 
@@ -157,6 +158,17 @@ impl Orchestrator {
             folds: 0,
             on_event: None,
         })
+    }
+
+    /// Record which conversation started this run, so the manifest says where
+    /// the plan came from. Rewrites `run.json` straight away, so the link
+    /// survives even if the run does not finish.
+    pub fn attributed_to(mut self, chat_id: Option<String>) -> Result<Self, RunError> {
+        if chat_id.is_some() {
+            self.manifest.chat_id = chat_id;
+            fh_trace_write_manifest(&self.paths, &self.manifest)?;
+        }
+        Ok(self)
     }
 
     pub fn on_event(mut self, sink: EventSink) -> Self {
@@ -668,6 +680,11 @@ impl Orchestrator {
         }
         Ok(())
     }
+}
+
+fn fh_trace_write_manifest(paths: &TaskPaths, manifest: &RunManifest) -> Result<(), RunError> {
+    crate::trace::write_json(paths.manifest(), manifest)?;
+    Ok(())
 }
 
 fn describe_admission(outcome: AdmissionOutcome) -> String {

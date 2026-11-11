@@ -34,6 +34,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::agent::{ChatMessage, ModelProvider};
+use crate::history::{ChatRecord, StoredRole};
 use crate::plan::{self, Chain, Plan};
 use crate::TaskConfig;
 
@@ -350,6 +351,11 @@ pub struct ChatApp {
     quit: bool,
     /// Set when the user confirms; returned to the caller to run.
     confirmed: Option<TaskConfig>,
+
+    /// Saved after every exchange, so closing the terminal does not lose the
+    /// session.
+    record: ChatRecord,
+    chat_root: std::path::PathBuf,
 }
 
 impl ChatApp {
@@ -383,7 +389,17 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
             ));
         }
 
+        let record = ChatRecord::new(
+            provider.model(),
+            provider.endpoint(),
+            seed,
+            &binder,
+            &target,
+        );
+
         ChatApp {
+            record,
+            chat_root: crate::history::chat_root(),
             provider,
             runtime,
             binder,
@@ -406,8 +422,64 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
         }
     }
 
-    pub fn confirmed(self) -> Option<TaskConfig> {
-        self.confirmed
+    /// The confirmed config, with the id of the conversation that produced it.
+    pub fn confirmed(self) -> Option<(TaskConfig, String)> {
+        let id = self.record.id.clone();
+        self.confirmed.map(|config| (config, id))
+    }
+
+    pub fn chat_id(&self) -> &str {
+        &self.record.id
+    }
+
+    /// Carry on a stored conversation. The transcript is rebuilt so the screen
+    /// opens where it left off.
+    pub fn resumed(mut self, record: ChatRecord) -> Self {
+        self.transcript.push((
+            Entry::Harness,
+            format!(
+                "Resumed chat {} from {}, {} message(s).",
+                record.id,
+                crate::history::ago(record.updated_at_ms),
+                record.messages.len()
+            ),
+        ));
+        for message in &record.messages {
+            let entry = match message.role {
+                StoredRole::User => Entry::You,
+                StoredRole::Assistant => Entry::Model,
+            };
+            self.transcript.push((entry, message.text.clone()));
+        }
+        self.history = record.to_messages();
+
+        // A stored plan is not replayed as validated: re-deriving it from the
+        // last reply keeps one definition of what a valid plan is.
+        if let Some(last) = record
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == StoredRole::Assistant)
+        {
+            let text = last.text.clone();
+            self.validate(&text);
+        }
+
+        self.record = record;
+        self
+    }
+
+    /// Write the conversation to disk. A failure is shown but does not
+    /// interrupt the session: losing the history is better than losing the
+    /// chat.
+    fn remember(&mut self) {
+        self.record.set_messages(&self.history);
+        if let Some(plan) = self.plan.as_ref() {
+            self.record.plan_name = Some(plan.config.name.clone());
+        }
+        if let Err(error) = self.record.save(&self.chat_root) {
+            self.status = format!("could not save the chat: {error}");
+        }
     }
 
     fn note(&mut self, text: impl Into<String>) {
@@ -455,6 +527,7 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
                 self.plan = None;
                 self.plan_error = None;
                 self.note("Conversation cleared. The next message starts a fresh one.");
+                self.remember();
             }
             Slash::Plan => match self.plan.as_ref() {
                 None => self.note("No validated plan yet."),
@@ -557,6 +630,7 @@ is checked below in case it was already complete."
                             ));
                             self.history.push(ChatMessage::assistant(text.clone()));
                             self.validate(&text);
+                            self.remember();
                         }
                     }
                     return;
@@ -573,6 +647,7 @@ is checked below in case it was already complete."
                     self.history.push(ChatMessage::assistant(reply.clone()));
                     self.follow = true;
                     self.validate(&reply);
+                    self.remember();
                     return;
                 }
             }
@@ -952,8 +1027,12 @@ pub fn run(
     binder: Vec<Chain>,
     target: Vec<Chain>,
     seed: u64,
-) -> io::Result<Option<TaskConfig>> {
+    resume: Option<ChatRecord>,
+) -> io::Result<Option<(TaskConfig, String)>> {
     let mut app = ChatApp::new(provider, runtime, binder, target, seed);
+    if let Some(record) = resume {
+        app = app.resumed(record);
+    }
 
     // Entering raw mode on a non-terminal fails with "Device not configured",
     // which says nothing useful. Check first.
@@ -1358,9 +1437,10 @@ mod tests {
 
         app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert!(app.quit);
-        let config = app.confirmed().expect("a config was confirmed");
+        let (config, chat_id) = app.confirmed().expect("a config was confirmed");
         assert_eq!(config.name, "demo");
         assert_eq!(config.design.cycles, 4);
+        assert!(!chat_id.is_empty(), "the run must know its conversation");
     }
 
     #[tokio::test]

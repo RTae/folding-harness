@@ -34,6 +34,7 @@ pub mod contract;
 pub mod fasta;
 pub mod fold;
 pub mod gate;
+pub mod history;
 pub mod ids;
 pub mod metrics;
 pub mod orchestrator;
@@ -46,6 +47,7 @@ pub mod search;
 pub mod skills;
 pub mod trace;
 pub mod tui;
+pub mod web;
 
 pub use candidate::{Candidate, Origin};
 pub use config::{

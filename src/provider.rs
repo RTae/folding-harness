@@ -382,6 +382,10 @@ impl ModelProvider for Provider {
         &self.model
     }
 
+    fn endpoint(&self) -> &str {
+        self.host()
+    }
+
     async fn complete(&self, system: &str, user: &str) -> Result<String, AgentError> {
         self.converse(system, &[ChatMessage::user(user)]).await
     }
