@@ -64,12 +64,18 @@ population:
 
 # Hard thresholds. A candidate that fails any of these is recorded as rejected
 # and never enters the population, whatever its loss.
+#
+# Set these at or below where your starting sequence already scores. A gate
+# above the founder admits nothing, the population never grows past the
+# founder, and the search has no ratchet to climb — `fh run` will say so on the
+# first cycle ("founder admitted despite failing a gate") and then reject
+# everything. Tighten them once a run is clearing them comfortably.
 gates:
-  min_iptm: 0.45
-  min_interface_plddt: 60.0
-  max_pae_interface: 15.0
+  min_iptm: 0.25
+  min_interface_plddt: 48.0
+  max_pae_interface: 25.0
   max_clashes: 2
-  min_interface_contacts: 10
+  min_interface_contacts: 8
   max_hydrophobic_patch: 0.75
 
 # Weights on the normalised loss terms. Lower loss is better.

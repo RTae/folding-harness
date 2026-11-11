@@ -1,38 +1,50 @@
-[workspace]
-members = ["crates/*"]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "folding-harness"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
+description = "A design harness: orchestration, typed gates and terminal inspection around a structure-prediction backend"
 authors = ["folding-harness contributors"]
+readme = "README.md"
 
-[workspace.dependencies]
-# --- internal ---
-fh-core = { path = "crates/fh-core" }
-fh-contract = { path = "crates/fh-contract" }
-fh-fold = { path = "crates/fh-fold" }
-fh-skills = { path = "crates/fh-skills" }
-fh-agent = { path = "crates/fh-agent" }
-fh-trace = { path = "crates/fh-trace" }
-fh-orchestrator = { path = "crates/fh-orchestrator" }
-fh-tui = { path = "crates/fh-tui" }
+[lib]
+name = "fh"
+path = "src/lib.rs"
 
-# --- external ---
+[[bin]]
+name = "fh"
+path = "src/main.rs"
+
+[dependencies]
 anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "signal"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "time",
+    "sync",
+    "signal",
+    "net",
+] }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 axum = "0.7"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
+# `rand` supplies the traits; the generator itself is ChaCha, which guarantees a
+# stable value stream across versions. StdRng explicitly does not, and a run
+# that cannot be reproduced from its seed would undermine the manifest.
 rand = "0.8"
+rand_chacha = "0.3"
+sha2 = "0.10"
 
 [profile.release]
 lto = "thin"
