@@ -75,6 +75,9 @@ pub struct ChatRecord {
     /// Name of the last plan that validated.
     #[serde(default)]
     pub plan_name: Option<String>,
+    /// Tokens this conversation has used.
+    #[serde(default)]
+    pub usage: crate::usage::Usage,
 }
 
 impl ChatRecord {
@@ -101,6 +104,7 @@ impl ChatRecord {
             messages: Vec::new(),
             task_ids: Vec::new(),
             plan_name: None,
+            usage: crate::usage::Usage::default(),
         }
     }
 

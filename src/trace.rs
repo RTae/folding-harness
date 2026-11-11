@@ -418,6 +418,9 @@ pub struct RunManifest {
     /// The chat this run was started from, when it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
+    /// What the run spent: folds, backend time, and model tokens if any.
+    #[serde(default)]
+    pub usage: crate::usage::Usage,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {

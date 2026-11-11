@@ -404,6 +404,7 @@ impl TextInput {
 enum Slash {
     Help,
     Provider,
+    Spend,
     SetModel(String),
     SetUrl(String),
     Retry,
@@ -425,6 +426,7 @@ fn parse_slash(line: &str) -> Option<Slash> {
     Some(match name.as_str() {
         "help" | "h" | "?" => Slash::Help,
         "provider" => Slash::Provider,
+        "spend" | "usage" | "cost" => Slash::Spend,
         "model" | "m" => match argument {
             Some(value) if !value.is_empty() => Slash::SetModel(value),
             _ => Slash::Model,
@@ -454,6 +456,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
         "",
         "choose where prompts go, from your saved profiles",
     ),
+    ("/spend", "", "tokens this session has used"),
     (
         "/model",
         " <name>",
@@ -840,6 +843,7 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
     /// chat.
     fn remember(&mut self) {
         self.record.set_messages(&self.history);
+        self.record.usage = self.provider.usage();
         if let Some(plan) = self.plan.as_ref() {
             self.record.plan_name = Some(plan.config.name.clone());
         }
@@ -889,6 +893,10 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
                 self.note(text);
             }
             Slash::Provider => self.open_picker(),
+            Slash::Spend => {
+                let text = format!("this session: {}", self.provider.usage().summary());
+                self.note(text);
+            }
             Slash::SetModel(model) => {
                 let mut changed = self.settings.clone();
                 changed.model = Some(model.clone());

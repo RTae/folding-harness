@@ -49,6 +49,7 @@ pub mod settings;
 pub mod skills;
 pub mod trace;
 pub mod tui;
+pub mod usage;
 pub mod web;
 
 pub use candidate::{Candidate, Origin};

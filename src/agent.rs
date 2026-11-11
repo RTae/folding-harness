@@ -266,6 +266,12 @@ pub trait ModelProvider: Send + Sync {
         true
     }
 
+    /// What this provider has spent so far. A provider that does not count
+    /// reports nothing, which reads differently from counting zero.
+    fn usage(&self) -> crate::usage::Usage {
+        crate::usage::Usage::default()
+    }
+
     /// One line naming the model and where prompts go, printed before any is
     /// sent. A provider that reaches a third party should say so.
     fn describe(&self) -> String {

@@ -61,6 +61,7 @@ pub struct Provider {
     /// Send `fallbacks` and its beta header. First-party only by default.
     fallbacks: bool,
     max_tokens: u32,
+    meter: crate::usage::Meter,
 }
 
 /// Earlier name for [`Provider`], kept so existing callers keep working.
@@ -92,6 +93,7 @@ impl Provider {
             fallbacks: true,
             max_tokens: 16000,
             base_url: DEFAULT_BASE_URL.to_string(),
+            meter: crate::usage::Meter::new(),
         };
 
         if let Some(url) = &settings.url {
@@ -152,6 +154,7 @@ impl Provider {
             fallbacks: true,
             max_tokens: 16000,
             base_url: DEFAULT_BASE_URL.to_string(),
+            meter: crate::usage::Meter::new(),
         };
         Ok(provider.with_base_url(base_url))
     }
@@ -400,6 +403,10 @@ impl ModelProvider for Provider {
         Provider::is_first_party(self)
     }
 
+    fn usage(&self) -> crate::usage::Usage {
+        self.meter.snapshot()
+    }
+
     fn describe(&self) -> String {
         Provider::describe(self)
     }
@@ -454,6 +461,8 @@ impl ModelProvider for Provider {
         let mut text = String::new();
         let mut stop_reason: Option<String> = None;
         let mut refusal: Option<String> = None;
+        let mut input_tokens: Option<u64> = None;
+        let mut output_tokens: Option<u64> = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| {
@@ -486,7 +495,16 @@ impl ModelProvider for Provider {
                                 }
                             }
                         }
+                        Some("message_start") => {
+                            if let Some(tokens) = value["message"]["usage"]["input_tokens"].as_u64()
+                            {
+                                input_tokens = Some(tokens);
+                            }
+                        }
                         Some("message_delta") => {
+                            if let Some(tokens) = value["usage"]["output_tokens"].as_u64() {
+                                output_tokens = Some(tokens);
+                            }
                             if let Some(reason) = value["delta"]["stop_reason"].as_str() {
                                 stop_reason = Some(reason.to_string());
                             }
@@ -507,6 +525,8 @@ impl ModelProvider for Provider {
                 }
             }
         }
+
+        self.meter.record_call(input_tokens, output_tokens);
 
         if stop_reason.as_deref() == Some("refusal") {
             return Err(AgentError::Provider(format!(
@@ -552,6 +572,10 @@ impl ModelProvider for Provider {
             return Err(self.status_error(status.as_u16(), &text));
         }
 
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            let (input, output) = crate::usage::tokens_from_body(&value);
+            self.meter.record_call(input, output);
+        }
         text_from_response(&text)
     }
 }
@@ -570,6 +594,7 @@ mod tests {
             effort: Some("high".to_string()),
             fallbacks: true,
             max_tokens: 16000,
+            meter: crate::usage::Meter::new(),
         }
     }
 

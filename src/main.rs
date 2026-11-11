@@ -677,6 +677,13 @@ fn report(summary: &fh::orchestrator::RunSummary) {
         }
         None => println!("no candidate survived the gates"),
     }
+    if let Ok(manifest) =
+        fh::trace::read_json::<fh::trace::RunManifest>(summary.root.join("run.json"))
+    {
+        if !manifest.usage.is_empty() {
+            println!("spent {}", manifest.usage.summary());
+        }
+    }
     println!();
     println!("results {}", summary.root.display());
     println!("inspect fh board --path {}", summary.root.display());
@@ -1287,6 +1294,11 @@ async fn task_from_prose(
     if let Some(notes) = &plan.config.notes {
         println!();
         println!("notes       {notes}");
+    }
+    let spent = provider.usage();
+    if !spent.is_empty() {
+        println!();
+        println!("spent       {}", spent.summary());
     }
     println!();
     println!("A prediction is not a measurement; results need experimental validation.");

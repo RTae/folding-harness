@@ -87,6 +87,7 @@ pub struct Orchestrator {
     task_id: TaskId,
     next_id: u32,
     folds: usize,
+    meter: crate::usage::Meter,
     on_event: Option<EventSink>,
 }
 
@@ -133,6 +134,7 @@ impl Orchestrator {
             best_candidate: None,
             best_loss: None,
             chat_id: None,
+            usage: crate::usage::Usage::default(),
         };
         crate::trace::write_json(paths.manifest(), &manifest)?;
 
@@ -156,6 +158,7 @@ impl Orchestrator {
             task_id,
             next_id: 0,
             folds: 0,
+            meter: crate::usage::Meter::new(),
             on_event: None,
         })
     }
@@ -281,6 +284,7 @@ impl Orchestrator {
 
         self.manifest.finished_at_ms = Some(now_ms());
         self.manifest.folds = self.folds;
+        self.manifest.usage = self.meter.snapshot();
         self.manifest.best_candidate = best.as_ref().map(|candidate| candidate.id);
         self.manifest.best_loss = best.as_ref().and_then(|candidate| candidate.loss);
         crate::trace::write_json(self.paths.manifest(), &self.manifest)?;
@@ -322,6 +326,7 @@ impl Orchestrator {
             .await
             .map_err(|error| RunError::FounderFoldFailed(error.to_string()))?;
         self.folds += 1;
+        self.meter.record_fold(result.elapsed_ms);
 
         self.emit(Event::FoldFinished {
             cycle: 0,
@@ -660,6 +665,13 @@ impl Orchestrator {
         }
 
         self.folds += collected.len();
+        for (_, outcome) in &collected {
+            let elapsed = outcome
+                .as_ref()
+                .map(|result| result.elapsed_ms)
+                .unwrap_or(0);
+            self.meter.record_fold(elapsed);
+        }
 
         let mut ordered = Vec::with_capacity(candidates.len());
         for candidate in candidates {

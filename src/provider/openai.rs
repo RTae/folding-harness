@@ -30,6 +30,7 @@ pub struct OpenAiProvider {
     token: String,
     model: String,
     max_tokens: Option<u32>,
+    meter: crate::usage::Meter,
 }
 
 impl OpenAiProvider {
@@ -53,6 +54,7 @@ impl OpenAiProvider {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             max_tokens: settings.max_tokens,
+            meter: crate::usage::Meter::new(),
         })
     }
 
@@ -190,6 +192,10 @@ impl ModelProvider for OpenAiProvider {
         OpenAiProvider::is_first_party(self)
     }
 
+    fn usage(&self) -> crate::usage::Usage {
+        self.meter.snapshot()
+    }
+
     fn describe(&self) -> String {
         OpenAiProvider::describe(self)
     }
@@ -224,6 +230,10 @@ impl ModelProvider for OpenAiProvider {
         if !status.is_success() {
             return Err(self.status_error(status.as_u16(), &text));
         }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            let (input, output) = crate::usage::tokens_from_body(&value);
+            self.meter.record_call(input, output);
+        }
         text_from_response(&text)
     }
 
@@ -242,6 +252,9 @@ impl ModelProvider for OpenAiProvider {
         let mut body = self.request_body(system, messages);
         if let Some(map) = body.as_object_mut() {
             map.insert("stream".into(), json!(true));
+            // Token counts are not sent during a stream unless asked for. An
+            // endpoint that does not know the field ignores it.
+            map.insert("stream_options".into(), json!({ "include_usage": true }));
         }
 
         let response = self
@@ -267,6 +280,8 @@ impl ModelProvider for OpenAiProvider {
         let mut buffer: Vec<u8> = Vec::new();
         let mut text = String::new();
         let mut finish: Option<String> = None;
+        let mut input_tokens: Option<u64> = None;
+        let mut output_tokens: Option<u64> = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| {
@@ -289,6 +304,10 @@ impl ModelProvider for OpenAiProvider {
                     let Ok(value) = serde_json::from_str::<Value>(data) else {
                         continue;
                     };
+                    let (input, output) = crate::usage::tokens_from_body(&value);
+                    input_tokens = input.or(input_tokens);
+                    output_tokens = output.or(output_tokens);
+
                     let choice = &value["choices"][0];
                     if let Some(piece) = choice["delta"]["content"].as_str() {
                         if !piece.is_empty() {
@@ -309,6 +328,8 @@ impl ModelProvider for OpenAiProvider {
                 }
             }
         }
+
+        self.meter.record_call(input_tokens, output_tokens);
 
         if text.trim().is_empty() {
             return Err(AgentError::Provider(format!(
