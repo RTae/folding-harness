@@ -45,6 +45,7 @@ pub mod proposal;
 pub mod provider;
 pub mod scaffold;
 pub mod search;
+pub mod settings;
 pub mod skills;
 pub mod trace;
 pub mod tui;

@@ -114,9 +114,11 @@ several lines stays one message, because the screen turns on bracketed paste
 and reads a paste as one event rather than as a burst of Enter presses. Left
 and Right and Home and End move within a line, Ctrl-W deletes a word, Ctrl-U
 clears the message, and Up and Down move between lines or recall earlier
-messages. The slash commands
-`/help`, `/plan`, `/run`, `/save [path]`, `/model`, `/clear` and `/quit` run
-locally and never reach the model. `F1` prints the same list as `/help`.
+messages. The slash commands `/help`, `/provider`, `/model`, `/url`, `/retry`, `/plan`,
+`/run`, `/save [path]`, `/clear` and `/quit` run locally and never reach the
+model. `/retry` asks again without adding a message, for a reply that was cut
+off mid-JSON. `/model <name>` and `/url <url>` switch where prompts go and
+remember the choice for later commands. `F1` prints the same list as `/help`.
 
 The pane on the right is **not the model's description of the plan**. It is what
 the typed config resolves to after the same validation a hand-written file
@@ -140,6 +142,44 @@ Two deliberate limits:
 `fh task "<prose>" --binder ... --target ...` is the same thing without the
 interface. It prints the plan, writes `task.yaml`, and with `--run` starts the
 run after a confirmation.
+
+### Provider profiles
+
+Endpoints are named, so switching is a word rather than a URL and a model id
+remembered correctly:
+
+```bash
+fh config add gateway --url https://gateway.example.com --model claude-opus-4-7
+fh config add fast --url https://gateway.example.com --model claude-opus-5-5
+fh config list
+fh config use anthropic
+```
+
+```
+* anthropic      (default model) via api.anthropic.com
+  fast           claude-opus-5-5 via gateway.example.com
+  gateway        claude-opus-4-7 via gateway.example.com
+```
+
+`anthropic` is built in and always offered, so the list is never empty and a
+deleted profile cannot strand the configuration. Inside `fh chat`, `/provider`
+opens a picker over the same profiles: Up and Down to choose, Enter to switch,
+Esc to cancel. The switch applies to the running session and is remembered.
+
+`fh config show` prints the active profile's settings and where each value came
+from, `fh config set` changes the active profile, and `fh config clear` forgets
+everything.
+
+Precedence, highest first: a flag, then the environment, then the saved file,
+then the default. The file is a convenience and never a trap, because whatever
+you type on the command line is what happens. Inside `fh chat`, `/provider`
+shows the same thing and `/model` and `/url` change it without leaving the
+screen.
+
+**No API key is stored.** Credentials come from `ANTHROPIC_API_KEY` or
+`ANTHROPIC_AUTH_TOKEN`. A config file outlives the session and is easy to
+commit by accident, so the settings type has nowhere to put one, and a file
+that tries to smuggle one in is rejected.
 
 ### A custom endpoint
 
@@ -408,6 +448,7 @@ no Node, and no second runtime.
 | `src/trace.rs` | event log, task directory layout, run manifest |
 | `src/history.rs` | saved chats, and the link between a chat and its runs |
 | `src/bench.rs` | policy comparison against the fixture's planted optimum |
+| `src/settings.rs` | remembered provider settings, and where each value came from |
 | `src/web/` | the local web view: `mod.rs`, plus the page, script and stylesheet |
 | `src/orchestrator.rs` | the cycle |
 | `src/tui/` | the dashboard, `chat.rs`, and `structure.rs` for the backbone projection |

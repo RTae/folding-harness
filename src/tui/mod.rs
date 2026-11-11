@@ -355,7 +355,7 @@ impl App {
                     text.to_string()
                 },
                 Style::default()
-                    .fg(if active { Color::Cyan } else { Color::DarkGray })
+                    .fg(if active { Color::Cyan } else { Color::White })
                     .add_modifier(Modifier::BOLD),
             ))
         };
@@ -399,11 +399,11 @@ impl App {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  Quitting does not stop the run.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
         lines.push(Line::from(Span::styled(
             "  Reopen this view with `fh board`.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
 
         let height = lines.len() as u16 + 2;
@@ -446,31 +446,31 @@ impl App {
                     .as_ref()
                     .map(|m| m.task_id.clone())
                     .unwrap_or_default(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ),
         ])];
 
         if let Some(manifest) = &self.manifest {
             lines.push(Line::from(vec![
-                Span::styled("backend ", Style::default().fg(Color::DarkGray)),
+                Span::styled("backend ", Style::default().fg(Color::Gray)),
                 Span::raw(manifest.backend.clone()),
-                Span::styled("  model ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  model ", Style::default().fg(Color::Gray)),
                 Span::raw(manifest.model.clone()),
-                Span::styled("  protocol ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  protocol ", Style::default().fg(Color::Gray)),
                 Span::raw(manifest.protocol.clone()),
-                Span::styled("  seed ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  seed ", Style::default().fg(Color::Gray)),
                 Span::raw(manifest.seed.to_string()),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("config ", Style::default().fg(Color::DarkGray)),
+                Span::styled("config ", Style::default().fg(Color::Gray)),
                 Span::raw(manifest.config_sha256.chars().take(12).collect::<String>()),
-                Span::styled("  folds ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  folds ", Style::default().fg(Color::Gray)),
                 Span::raw(manifest.folds.max(self.folds()).to_string()),
             ]));
         }
         if let Some(snapshot) = &self.snapshot {
             lines.push(Line::from(vec![
-                Span::styled("scope ", Style::default().fg(Color::DarkGray)),
+                Span::styled("scope ", Style::default().fg(Color::Gray)),
                 Span::raw(snapshot.scope.clone()),
             ]));
         }
@@ -525,20 +525,20 @@ impl App {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(vec![
-                    Span::styled("best loss ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("best loss ", Style::default().fg(Color::Gray)),
                     Span::styled(
                         best,
                         Style::default()
                             .fg(Color::Green)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("   mean ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("   mean ", Style::default().fg(Color::Gray)),
                     Span::raw(mean),
                 ]),
                 Line::from(vec![
-                    Span::styled("population ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("population ", Style::default().fg(Color::Gray)),
                     Span::raw(self.members().len().to_string()),
-                    Span::styled("   events ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("   events ", Style::default().fg(Color::Gray)),
                     Span::raw(self.events.len().to_string()),
                 ]),
             ]),
@@ -556,10 +556,7 @@ impl App {
             .enumerate()
             .map(|(index, tab)| {
                 Line::from(vec![
-                    Span::styled(
-                        format!("{} ", index + 1),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(format!("{} ", index + 1), Style::default().fg(Color::Gray)),
                     Span::raw(tab.title()),
                 ])
             })
@@ -602,7 +599,7 @@ impl App {
         if curve.len() < 2 {
             frame.render_widget(
                 Paragraph::new("waiting for a second completed cycle to plot the curve")
-                    .style(Style::default().fg(Color::DarkGray))
+                    .style(Style::default().fg(Color::Gray))
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
@@ -632,7 +629,7 @@ impl App {
                     )
                     .x_axis(
                         Axis::default()
-                            .style(Style::default().fg(Color::DarkGray))
+                            .style(Style::default().fg(Color::Gray))
                             .bounds([1.0, max_x.max(2.0)])
                             .labels(vec![
                                 Span::raw("1"),
@@ -641,7 +638,7 @@ impl App {
                     )
                     .y_axis(
                         Axis::default()
-                            .style(Style::default().fg(Color::DarkGray))
+                            .style(Style::default().fg(Color::Gray))
                             .bounds([min_y - pad, max_y + pad])
                             .labels(vec![
                                 Span::raw(format!("{:.3}", min_y - pad)),
@@ -701,7 +698,7 @@ impl App {
             )
             .header(
                 Row::new(vec!["cyc", "skill", "adm", "best", ""])
-                    .style(Style::default().fg(Color::DarkGray)),
+                    .style(Style::default().fg(Color::Gray)),
             )
             .block(
                 Block::default()
@@ -714,7 +711,7 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
             "rejections by kind",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
         let mut counts: HashMap<String, usize> = HashMap::new();
         for record in &self.events {
@@ -728,7 +725,7 @@ impl App {
         if counts.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  none yet",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             )));
         } else {
             let mut pairs: Vec<(String, usize)> = counts.into_iter().collect();
@@ -745,7 +742,7 @@ impl App {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "last routing decision",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
         let routed = self
             .events
@@ -760,7 +757,7 @@ impl App {
         match routed {
             None => lines.push(Line::from(Span::styled(
                 "  not yet",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ))),
             Some((legal, blocked)) => {
                 lines.push(Line::from(vec![
@@ -770,7 +767,7 @@ impl App {
                 for reason in blocked.iter().take(4) {
                     lines.push(Line::from(vec![
                         Span::raw("  - "),
-                        Span::styled(reason.clone(), Style::default().fg(Color::DarkGray)),
+                        Span::styled(reason.clone(), Style::default().fg(Color::Gray)),
                     ]));
                 }
             }
@@ -840,13 +837,9 @@ impl App {
             Row::new(vec![
                 "#", "id", "parent", "origin", "loss", "ipTM", "iface", "cl", "sub",
             ])
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(Color::Gray)),
         )
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
         .highlight_symbol("> ")
         .block(
             Block::default()
@@ -863,7 +856,7 @@ impl App {
         let Some(candidate) = selected else {
             frame.render_widget(
                 Paragraph::new("no candidate selected")
-                    .style(Style::default().fg(Color::DarkGray))
+                    .style(Style::default().fg(Color::Gray))
                     .block(Block::default().borders(Borders::ALL).title(" detail ")),
                 area,
             );
@@ -882,9 +875,9 @@ impl App {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  cycle ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  cycle ", Style::default().fg(Color::Gray)),
             Span::raw(candidate.cycle.to_string()),
-            Span::styled("  via ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  via ", Style::default().fg(Color::Gray)),
             Span::styled(
                 candidate.origin.label().to_string(),
                 Style::default().fg(Color::Cyan),
@@ -893,7 +886,7 @@ impl App {
 
         lines.push(Line::from(Span::styled(
             candidate.rationale.clone(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
         lines.push(Line::from(""));
 
@@ -901,7 +894,7 @@ impl App {
             let breakdown = loss_breakdown(metrics, &config.loss);
             lines.push(Line::from(Span::styled(
                 format!("loss {:.4} by term", breakdown.total),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             )));
             let mut terms = breakdown.terms.clone();
             terms.sort_by(|a, b| b.contribution.total_cmp(&a.contribution));
@@ -910,7 +903,7 @@ impl App {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{:>19} ", term.name),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     ),
                     Span::styled(
                         "\u{2588}".repeat(width.min(18)),
@@ -938,7 +931,7 @@ impl App {
         let Some(scaffold) = self.scaffold.as_ref() else {
             frame.render_widget(
                 Paragraph::new("task.yaml not readable, so the mutable scope is unknown")
-                    .style(Style::default().fg(Color::DarkGray))
+                    .style(Style::default().fg(Color::Gray))
                     .block(Block::default().borders(Borders::ALL).title(" sequence ")),
                 area,
             );
@@ -964,7 +957,7 @@ impl App {
                 ),
                 Span::styled(
                     format!("{} residues", current.len()),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
                 ),
             ]));
 
@@ -973,7 +966,7 @@ impl App {
                 let start = row * width;
                 let mut spans = vec![Span::styled(
                     format!("{:>5} ", start + 1),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
                 )];
                 for (offset, residue) in window.iter().enumerate() {
                     let position = start + offset;
@@ -989,7 +982,7 @@ impl App {
                             .bg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                         (true, false) => Style::default().fg(Color::Green),
-                        (false, false) => Style::default().fg(Color::DarkGray),
+                        (false, false) => Style::default().fg(Color::Gray),
                     };
                     spans.push(Span::styled(residue.to_string(), style));
                 }
@@ -1063,11 +1056,11 @@ impl App {
                     style = style.fg(Color::Green).add_modifier(Modifier::BOLD);
                 }
                 if Some(candidate.id) == selected {
-                    style = style.bg(Color::DarkGray);
+                    style = style.add_modifier(Modifier::REVERSED);
                 }
 
                 lines.push(Line::from(vec![
-                    Span::styled(branch, Style::default().fg(Color::DarkGray)),
+                    Span::styled(branch, Style::default().fg(Color::Gray)),
                     Span::styled(candidate.id.to_string(), style),
                     Span::styled(
                         format!("  {:.4}  ", candidate.loss.unwrap_or(f64::NAN)),
@@ -1079,7 +1072,7 @@ impl App {
                     ),
                     Span::styled(
                         format!("  cycle {}", candidate.cycle),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     ),
                 ]));
 
@@ -1114,7 +1107,7 @@ impl App {
         let Some(candidate) = selected else {
             frame.render_widget(
                 Paragraph::new("no candidate selected")
-                    .style(Style::default().fg(Color::DarkGray))
+                    .style(Style::default().fg(Color::Gray))
                     .block(Block::default().borders(Borders::ALL).title(" structure ")),
                 area,
             );
@@ -1180,7 +1173,7 @@ impl App {
                             ConfidenceBand::VeryLow => Color::Red,
                         }
                     } else {
-                        Color::DarkGray
+                        Color::Gray
                     };
                     ctx.draw(&CanvasLine {
                         x1: from.x,
@@ -1193,7 +1186,7 @@ impl App {
                 ctx.layer();
                 ctx.draw(&Points {
                     coords: &target,
-                    color: Color::DarkGray,
+                    color: Color::Gray,
                 });
                 ctx.draw(&Points {
                     coords: &very_low,
@@ -1218,25 +1211,22 @@ impl App {
         let designed = snapshot.ca_trace.iter().filter(|r| r.designed).count();
         let mut lines = vec![
             Line::from(vec![
-                Span::styled("candidate ", Style::default().fg(Color::DarkGray)),
+                Span::styled("candidate ", Style::default().fg(Color::Gray)),
                 Span::raw(candidate.id.to_string()),
             ]),
             Line::from(vec![
-                Span::styled("residues  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("residues  ", Style::default().fg(Color::Gray)),
                 Span::raw(format!("{} ({designed} designed)", snapshot.ca_trace.len())),
             ]),
             Line::from(vec![
-                Span::styled("view      ", Style::default().fg(Color::DarkGray)),
+                Span::styled("view      ", Style::default().fg(Color::Gray)),
                 Span::raw(format!(
                     "yaw {:.2} pitch {:.2} zoom {:.2}",
                     camera.yaw, camera.pitch, camera.zoom
                 )),
             ]),
             Line::from(""),
-            Line::from(Span::styled(
-                "confidence",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled("confidence", Style::default().fg(Color::Gray))),
         ];
 
         for (band, color) in [
@@ -1251,13 +1241,13 @@ impl App {
             ]));
         }
         lines.push(Line::from(vec![
-            Span::styled("  \u{2588}\u{2588} ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  \u{2588}\u{2588} ", Style::default().fg(Color::Gray)),
             Span::raw("target (fixed)"),
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "h/l yaw  u/d pitch  +/- zoom  0 reset",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1301,7 +1291,7 @@ impl App {
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("{:>6.1}s ", seconds),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     ),
                     Span::styled(format!("{kind:<16}"), Style::default().fg(color)),
                     Span::raw(record.event.summary()),
@@ -1445,6 +1435,22 @@ fn event_loop<B: ratatui::backend::Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Terminal themes vary, and ANSI bright-black disappears on several of
+    /// them. Anything carrying meaning has to survive that, so the dimmest
+    /// colour either screen uses is `Gray`.
+    #[test]
+    fn no_pane_draws_meaning_in_a_colour_that_vanishes_on_some_themes() {
+        // Split so this test's own source does not match the needle.
+        let needle = concat!("Color::", "DarkGray");
+        for (name, source) in [
+            ("tui/mod.rs", include_str!("mod.rs")),
+            ("tui/chat.rs", include_str!("chat.rs")),
+        ] {
+            let uses = source.lines().filter(|line| line.contains(needle)).count();
+            assert_eq!(uses, 0, "{name} still draws in {needle}");
+        }
+    }
 
     #[test]
     fn tabs_cycle_in_both_directions() {

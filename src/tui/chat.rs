@@ -31,12 +31,13 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::agent::{ChatMessage, ModelProvider};
 use crate::history::{ChatRecord, StoredRole};
 use crate::plan::{self, Chain, Plan};
+use crate::settings::{self, ProviderConfig, ProviderSettings};
 use crate::TaskConfig;
 
 /// What the model-call worker sends back.
@@ -402,6 +403,9 @@ impl TextInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Slash {
     Help,
+    Provider,
+    SetModel(String),
+    SetUrl(String),
     Retry,
     Run,
     Save(Option<String>),
@@ -420,11 +424,19 @@ fn parse_slash(line: &str) -> Option<Slash> {
     let argument = parts.next().map(|text| text.trim().to_string());
     Some(match name.as_str() {
         "help" | "h" | "?" => Slash::Help,
+        "provider" => Slash::Provider,
+        "model" | "m" => match argument {
+            Some(value) if !value.is_empty() => Slash::SetModel(value),
+            _ => Slash::Model,
+        },
+        "url" => match argument {
+            Some(value) if !value.is_empty() => Slash::SetUrl(value),
+            _ => Slash::Provider,
+        },
         "retry" => Slash::Retry,
         "run" | "r" => Slash::Run,
         "save" | "s" => Slash::Save(argument.filter(|text| !text.is_empty())),
         "plan" | "p" => Slash::Plan,
-        "model" | "m" => Slash::Model,
         "clear" => Slash::Clear,
         "quit" | "q" | "exit" => Slash::Quit,
         other => Slash::Unknown(other.to_string()),
@@ -432,6 +444,9 @@ fn parse_slash(line: &str) -> Option<Slash> {
 }
 
 const HELP: &str = "/help           this list
+/provider       choose where prompts go, from your saved profiles
+/model <name>   use a different model, and remember it
+/url <url>      use a different endpoint, and remember it
 /retry          ask again, for a reply that was cut off
 /plan           show the current plan summary again
 /run            run the validated plan (same as Ctrl-R)
@@ -475,7 +490,60 @@ pub struct ChatApp {
     /// session.
     record: ChatRecord,
     chat_root: std::path::PathBuf,
+
+    /// Settings the screen can change, and the means to apply them.
+    settings: ProviderSettings,
+    /// Where those settings live. Held rather than read from the environment
+    /// on each use, so a test can point it somewhere harmless without
+    /// mutating the process environment, which races other tests.
+    config_path: std::path::PathBuf,
+    rebuild: Option<ProviderFactory>,
+    /// Open when choosing a provider profile.
+    picker: Option<Picker>,
 }
+
+/// The provider chooser: a list of profile names and where the cursor is.
+#[derive(Debug, Clone)]
+struct Picker {
+    config: ProviderConfig,
+    names: Vec<String>,
+    selected: usize,
+}
+
+impl Picker {
+    fn open(config: ProviderConfig) -> Option<Picker> {
+        let names = config.names();
+        if names.is_empty() {
+            return None;
+        }
+        let active = config.active_name();
+        let selected = names.iter().position(|name| *name == active).unwrap_or(0);
+        Some(Picker {
+            config,
+            names,
+            selected,
+        })
+    }
+
+    fn move_by(&mut self, delta: isize) {
+        if self.names.is_empty() {
+            return;
+        }
+        let count = self.names.len() as isize;
+        let next = (self.selected as isize + delta).rem_euclid(count);
+        self.selected = next as usize;
+    }
+
+    fn chosen(&self) -> Option<&String> {
+        self.names.get(self.selected)
+    }
+}
+
+/// Builds a provider from settings. The screen cannot construct one itself:
+/// it holds a trait object and the concrete type lives a layer up, which is
+/// also what lets the tests run against a stub.
+pub type ProviderFactory =
+    Box<dyn Fn(&ProviderSettings) -> Result<Arc<dyn ModelProvider>, String> + Send>;
 
 impl ChatApp {
     pub fn new(
@@ -519,6 +587,10 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
         ChatApp {
             record,
             chat_root: crate::history::chat_root(),
+            settings: settings::load(),
+            config_path: settings::config_path(),
+            rebuild: None,
+            picker: None,
             provider,
             runtime,
             binder,
@@ -549,6 +621,95 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
 
     pub fn chat_id(&self) -> &str {
         &self.record.id
+    }
+
+    /// Let the screen change where prompts go.
+    pub fn with_provider_factory(mut self, factory: ProviderFactory) -> Self {
+        self.rebuild = Some(factory);
+        self
+    }
+
+    /// Point the remembered settings at a particular file.
+    pub fn with_config_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.config_path = path.into();
+        self.settings = settings::load_config_from(&self.config_path).active_settings();
+        self
+    }
+
+    fn open_picker(&mut self) {
+        if self.rebuild.is_none() {
+            self.status = "this session cannot change provider".to_string();
+            return;
+        }
+        match Picker::open(settings::load_config_from(&self.config_path)) {
+            None => self.status = "no provider profiles".to_string(),
+            Some(picker) => self.picker = Some(picker),
+        }
+    }
+
+    /// Switch to the highlighted profile.
+    fn choose_profile(&mut self) {
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        let Some(name) = picker.chosen().cloned() else {
+            return;
+        };
+
+        let mut config = picker.config;
+        config.active = Some(name.clone());
+        let settings = config.active_settings();
+
+        let Some(rebuild) = self.rebuild.as_ref() else {
+            return;
+        };
+        match rebuild(&settings) {
+            Err(error) => self.note(format!("Could not switch to {name}: {error}")),
+            Ok(provider) => {
+                let description = format!("{} via {}", provider.model(), provider.endpoint());
+                self.provider = provider;
+                self.settings = settings;
+                match settings::save_config_to(&self.config_path, &config) {
+                    Ok(()) => self.note(format!("Now using {name}: {description}.")),
+                    Err(error) => self.note(format!(
+                        "Now using {name}: {description}, but it could not be remembered: \
+{error}"
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Apply changed settings to this session and remember them.
+    ///
+    /// The change is saved only once the provider is built, so a typo in a
+    /// model name does not become the setting every later command inherits.
+    fn apply_settings(&mut self, changed: ProviderSettings, what: &str) {
+        let Some(rebuild) = self.rebuild.as_ref() else {
+            self.status = "this session cannot change provider".to_string();
+            return;
+        };
+        match rebuild(&changed) {
+            Err(error) => {
+                self.note(format!("Could not switch {what}: {error}"));
+            }
+            Ok(provider) => {
+                let description = format!("{} via {}", provider.model(), provider.endpoint());
+                self.provider = provider;
+                self.settings = changed;
+                match settings::save_to(&self.config_path, &self.settings)
+                    .map(|()| self.config_path.clone())
+                {
+                    Ok(path) => self.note(format!(
+                        "Now using {description}. Remembered in {}.",
+                        path.display()
+                    )),
+                    Err(error) => self.note(format!(
+                        "Now using {description}, but it could not be remembered: {error}"
+                    )),
+                }
+            }
+        }
     }
 
     /// Carry on a stored conversation. The transcript is rebuilt so the screen
@@ -640,6 +801,17 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
                     self.seed
                 );
                 self.note(text);
+            }
+            Slash::Provider => self.open_picker(),
+            Slash::SetModel(model) => {
+                let mut changed = self.settings.clone();
+                changed.model = Some(model.clone());
+                self.apply_settings(changed, &format!("to {model}"));
+            }
+            Slash::SetUrl(url) => {
+                let mut changed = self.settings.clone();
+                changed.url = Some(url.clone());
+                self.apply_settings(changed, &format!("to {url}"));
             }
             Slash::Clear => {
                 self.history.clear();
@@ -898,6 +1070,27 @@ task.yaml, or keep talking to change it."
         }
         self.status.clear();
 
+        // The picker takes the keys it needs, so a stray Enter cannot send a
+        // message while a profile is highlighted.
+        if self.picker.is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(picker) = self.picker.as_mut() {
+                        picker.move_by(-1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(picker) = self.picker.as_mut() {
+                        picker.move_by(1);
+                    }
+                }
+                KeyCode::Enter => self.choose_profile(),
+                KeyCode::Esc => self.picker = None,
+                _ => {}
+            }
+            return;
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => self.quit = true,
@@ -964,6 +1157,77 @@ task.yaml, or keep talking to change it."
         self.draw_input(frame, rows[1]);
         self.draw_footer(frame, rows[2]);
         self.draw_plan(frame, columns[1]);
+
+        if self.picker.is_some() {
+            self.draw_picker(frame, area);
+        }
+    }
+
+    fn draw_picker(&self, frame: &mut Frame, area: Rect) {
+        let Some(picker) = self.picker.as_ref() else {
+            return;
+        };
+        let active = picker.config.active_name();
+
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled(
+                "Choose where prompts go.",
+                Style::default().fg(Color::White),
+            )),
+            Line::from(""),
+        ];
+        for (index, name) in picker.names.iter().enumerate() {
+            let here = index == picker.selected;
+            let mut style = Style::default().fg(Color::White);
+            if here {
+                // Reversed video rather than a colour: it swaps foreground
+                // and background, so the highlight is visible on every theme.
+                style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", if here { '>' } else { ' ' }),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(format!("{name:<14}"), style),
+                Span::styled(
+                    format!(" {}", picker.config.summary(name)),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled(
+                    if *name == active { "  (current)" } else { "" }.to_string(),
+                    Style::default().fg(Color::Green),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Up/Down choose, Enter switch, Esc cancel.",
+            Style::default().fg(Color::Gray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Add one with: fh config add <name> --url ... --model ...",
+            Style::default().fg(Color::Gray),
+        )));
+
+        let height = lines.len() as u16 + 2;
+        let width = 68.min(area.width);
+        let popup = Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height: height.min(area.height),
+        };
+
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" provider \u{2014} Esc to close "),
+            ),
+            popup,
+        );
     }
 
     fn draw_transcript(&mut self, frame: &mut Frame, area: Rect) {
@@ -1222,8 +1486,12 @@ pub fn run(
     target: Vec<Chain>,
     seed: u64,
     resume: Option<ChatRecord>,
+    factory: Option<ProviderFactory>,
 ) -> io::Result<Option<(TaskConfig, String)>> {
     let mut app = ChatApp::new(provider, runtime, binder, target, seed);
+    if let Some(factory) = factory {
+        app = app.with_provider_factory(factory);
+    }
     if let Some(record) = resume {
         app = app.resumed(record);
     }
@@ -1663,6 +1931,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switching_model_rebuilds_the_provider_and_is_remembered() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Named(String);
+        #[async_trait::async_trait]
+        impl ModelProvider for Named {
+            fn model(&self) -> &str {
+                &self.0
+            }
+            fn endpoint(&self) -> &str {
+                "example.test"
+            }
+            async fn complete(&self, _: &str, _: &str) -> Result<String, AgentError> {
+                Ok(String::new())
+            }
+        }
+
+        // A file of its own, so this test does not race any other through the
+        // process environment.
+        let path = std::env::temp_dir().join(format!("fh-chatcfg-{}.json", crate::trace::now_ms()));
+
+        static BUILDS: AtomicUsize = AtomicUsize::new(0);
+        let mut app = app_with("")
+            .with_config_path(&path)
+            .with_provider_factory(Box::new(|settings| {
+                BUILDS.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(Named(
+                    settings.model.clone().unwrap_or_else(|| "none".to_string()),
+                )) as Arc<dyn ModelProvider>)
+            }));
+
+        // Point the saved settings somewhere harmless for the duration.
+        let path = std::env::temp_dir().join(format!("fh-chatcfg-{}.json", crate::trace::now_ms()));
+        std::env::set_var("FH_CONFIG", &path);
+
+        app.input.set("/model claude-opus-4-7");
+        app.submit();
+
+        assert_eq!(BUILDS.load(Ordering::SeqCst), 1, "the provider was rebuilt");
+        assert_eq!(app.provider.model(), "claude-opus-4-7");
+        assert_eq!(app.settings.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(
+            crate::settings::load_from(&path).model.as_deref(),
+            Some("claude-opus-4-7"),
+            "the choice should outlive the session"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_will_not_build_leaves_the_session_alone() {
+        let before = {
+            let app = app_with("");
+            app.provider.model().to_string()
+        };
+        let mut app =
+            app_with("").with_provider_factory(Box::new(|_| Err("no such model".to_string())));
+
+        app.input.set("/model nonsense");
+        app.submit();
+
+        assert_eq!(
+            app.provider.model(),
+            before,
+            "a failed switch must not change the session"
+        );
+        assert!(app.settings.model.is_none(), "and must not be remembered");
+        let note = &app.transcript.last().expect("a note").1;
+        assert!(note.contains("no such model"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn the_picker_lists_profiles_and_switches_on_enter() {
+        use crate::settings::{ProviderConfig, ProviderSettings};
+
+        let path = std::env::temp_dir().join(format!("fh-picker-{}.json", crate::trace::now_ms()));
+        let mut config = ProviderConfig::default();
+        config.profiles.insert(
+            "gateway".to_string(),
+            ProviderSettings {
+                url: Some("https://gw.test".to_string()),
+                model: Some("opus-4-7".to_string()),
+                ..Default::default()
+            },
+        );
+        crate::settings::save_config_to(&path, &config).expect("saves");
+
+        struct Named(String);
+        #[async_trait::async_trait]
+        impl ModelProvider for Named {
+            fn model(&self) -> &str {
+                &self.0
+            }
+            fn endpoint(&self) -> &str {
+                "gw.test"
+            }
+            async fn complete(&self, _: &str, _: &str) -> Result<String, AgentError> {
+                Ok(String::new())
+            }
+        }
+
+        let mut app = app_with("")
+            .with_config_path(&path)
+            .with_provider_factory(Box::new(|settings| {
+                Ok(Arc::new(Named(
+                    settings.model.clone().unwrap_or_else(|| "default".into()),
+                )) as Arc<dyn ModelProvider>)
+            }));
+
+        app.input.set("/provider");
+        app.submit();
+        let picker = app.picker.as_ref().expect("the picker opened");
+        assert_eq!(picker.names, vec!["anthropic", "gateway"]);
+
+        // Enter while it is open must choose, not send a message.
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let before = app.history.len();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.picker.is_none(), "the picker closed");
+        assert_eq!(app.history.len(), before, "Enter must not have sent");
+        // The chosen profile is live in this session and remembered for later.
+        assert_eq!(app.provider.model(), "opus-4-7");
+        assert_eq!(app.settings.model.as_deref(), Some("opus-4-7"));
+        assert_eq!(
+            crate::settings::load_config_from(&path).active_name(),
+            "gateway"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn escape_closes_the_picker_without_switching() {
+        let mut app = app_with("")
+            .with_provider_factory(Box::new(|_| Err("should not be built".to_string())));
+        app.input.set("/provider");
+        app.submit();
+        assert!(app.picker.is_some());
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.picker.is_none());
+        assert!(!app.quit, "Esc in the picker must not quit the chat");
+    }
+
+    #[tokio::test]
+    async fn provider_commands_parse() {
+        assert_eq!(
+            parse_slash("/model claude-opus-4-7"),
+            Some(Slash::SetModel("claude-opus-4-7".to_string()))
+        );
+        assert_eq!(
+            parse_slash("/url https://gateway.example.com"),
+            Some(Slash::SetUrl("https://gateway.example.com".to_string()))
+        );
+        // Bare forms ask rather than set.
+        assert_eq!(parse_slash("/model"), Some(Slash::Model));
+        assert_eq!(parse_slash("/url"), Some(Slash::Provider));
+        assert_eq!(parse_slash("/provider"), Some(Slash::Provider));
+    }
+
+    #[tokio::test]
     async fn clear_forgets_the_conversation_and_the_plan() {
         let mut app = app_with("");
         app.validate(GOOD_PLAN);
@@ -1789,11 +2220,20 @@ mod tests {
     async fn a_cut_off_plan_says_so_and_offers_retry() {
         let mut app = app_with("");
         // Valid as far as it goes, then the stream stopped.
-        app.validate("{\"topology\": \"vhh\", \"regions\": [");
+        // Valid as far as it goes: the inner object closes, the outer never
+        // does, which is exactly how a cut-off stream looks.
+        app.validate("{\"topology\": \"vhh\", \"gates\": {\"min_iptm\": 0.25}");
 
         let note = &app.transcript.last().expect("a note").1;
         assert!(note.contains("cut off"), "{note}");
         assert!(note.contains("/retry"), "{note}");
+
+        // And a reply that simply stops mid-object, with nothing closed at
+        // all, is also a truncation rather than "no JSON here".
+        let mut stopped = app_with("");
+        stopped.validate("{\"name\": \"exploratory-run\", \"topology\": \"vhh\", \"regions\": [");
+        let note = &stopped.transcript.last().expect("a note").1;
+        assert!(note.contains("cut off"), "{note}");
     }
 
     #[tokio::test]

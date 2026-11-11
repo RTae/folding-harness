@@ -60,6 +60,16 @@ struct ProviderOptions {
     /// Response token cap. Lower it if an endpoint rejects the default.
     #[arg(long)]
     max_tokens: Option<u32>,
+    /// Request shape this endpoint speaks: anthropic or openai.
+    #[arg(long)]
+    wire: Option<String>,
+    /// Environment variable holding the credential.
+    #[arg(long)]
+    key_env: Option<String>,
+    /// Command whose output is the credential, for an official login CLI or a
+    /// password manager. The command is stored, never the secret.
+    #[arg(long)]
+    key_command: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -227,12 +237,44 @@ enum Command {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+    /// Explain how to sign in for each wire, and what is already set.
+    Login,
+    /// Show or change the remembered provider settings.
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
     /// List saved chats.
     Chats {
         /// Print the whole transcript of one chat.
         #[arg(long)]
         show: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print the settings and where each value came from.
+    Show,
+    /// List the provider profiles.
+    List,
+    /// Switch to a profile.
+    Use { name: String },
+    /// Create or update a named profile.
+    Add {
+        name: String,
+        #[command(flatten)]
+        provider: ProviderOptions,
+    },
+    /// Delete a profile.
+    Remove { name: String },
+    /// Change the active profile's settings.
+    Set {
+        #[command(flatten)]
+        provider: ProviderOptions,
+    },
+    /// Forget everything saved.
+    Clear,
 }
 
 #[tokio::main]
@@ -344,6 +386,8 @@ async fn main() -> Result<()> {
             policy,
             json,
         } => bench(task, seeds, cycles, policy, json).await,
+        Command::Login => login(),
+        Command::Config { action } => config(action),
         Command::Chats { show } => list_chats(show),
     }
 }
@@ -664,29 +708,47 @@ fn load_chains(values: &[String], default_label: &str) -> Result<Vec<PlanChain>>
 ///
 /// Order matters: `with_base_url` resets the Anthropic-specific extras, so an
 /// explicit `--effort` after it still wins.
-fn make_provider(options: &ProviderOptions) -> Result<AnthropicProvider> {
-    let mut provider = AnthropicProvider::from_env().map_err(|error| anyhow!("{error}"))?;
-    if let Some(url) = &options.url {
-        provider = provider.with_base_url(url.clone());
+impl ProviderOptions {
+    fn as_settings(&self) -> fh::settings::ProviderSettings {
+        fh::settings::ProviderSettings {
+            url: self.url.clone(),
+            model: self.model.clone(),
+            api_version: self.api_version.clone(),
+            effort: self.effort.clone(),
+            max_tokens: self.max_tokens,
+            wire: self.wire.as_deref().and_then(fh::provider::Wire::parse),
+            key_env: self.key_env.clone(),
+            key_command: self.key_command.clone(),
+        }
     }
-    if let Some(model) = &options.model {
-        provider = provider.with_model(model.clone());
+}
+
+/// Build the provider from the saved settings, the environment and the flags.
+///
+/// Precedence, highest first: flag, environment, saved file, default. The
+/// saved file is a convenience, never a trap.
+fn effective_settings(options: &ProviderOptions) -> fh::settings::ProviderSettings {
+    fh::settings::load()
+        .overlay(&fh::settings::ProviderSettings::from_env())
+        .overlay(&options.as_settings())
+}
+
+fn make_provider(options: &ProviderOptions) -> Result<Arc<dyn ModelProvider>> {
+    let settings = effective_settings(options);
+    if let Some(name) = &options.wire {
+        if fh::provider::Wire::parse(name).is_none() {
+            return Err(anyhow!(
+                "no wire '{name}'; choose from: {}",
+                fh::provider::Wire::names()
+            ));
+        }
     }
-    if let Some(version) = &options.api_version {
-        provider = provider.with_api_version(version.clone());
-    }
-    if let Some(effort) = &options.effort {
-        provider = provider.with_effort(Some(effort.clone()));
-    }
-    if let Some(max_tokens) = options.max_tokens {
-        provider = provider.with_max_tokens(max_tokens);
-    }
-    Ok(provider)
+    fh::provider::build(&settings).map_err(|error| anyhow!("{error}"))
 }
 
 /// A gateway can return its own error as an ordinary HTTP 200 reply, which
 /// then reads as though the model said it. Say where the text came from.
-fn third_party_note(provider: &AnthropicProvider) -> String {
+fn third_party_note(provider: &Arc<dyn ModelProvider>) -> String {
     if provider.is_first_party() {
         return String::new();
     }
@@ -695,7 +757,7 @@ fn third_party_note(provider: &AnthropicProvider) -> String {
          ordinary reply, so the text above is not necessarily the model's words. Try another \
          --model (this endpoint is known to behave differently per model), a lower \
          --max-tokens, or the first-party API.",
-        provider.host()
+        provider.endpoint()
     )
 }
 
@@ -759,9 +821,32 @@ async fn chat(
         }
     };
 
-    let built = make_provider(&options)?;
-    println!("model {}", built.describe());
-    let provider: Arc<dyn ModelProvider> = Arc::new(built);
+    let provider = make_provider(&options)?;
+    println!("model {}", provider.describe());
+
+    // The screen can rebuild its provider when /model or /url changes it, and
+    // the flags given on this command still win over whatever it saves.
+    let overrides = options.as_settings();
+    let factory: fh::tui::chat::ProviderFactory = Box::new(move |settings| {
+        let merged = settings.overlay(&overrides);
+        let mut built = AnthropicProvider::from_env().map_err(|error| error.to_string())?;
+        if let Some(url) = &merged.url {
+            built = built.with_base_url(url.clone());
+        }
+        if let Some(model) = &merged.model {
+            built = built.with_model(model.clone());
+        }
+        if let Some(version) = &merged.api_version {
+            built = built.with_api_version(version.clone());
+        }
+        if let Some(effort) = &merged.effort {
+            built = built.with_effort(Some(effort.clone()));
+        }
+        if let Some(max_tokens) = merged.max_tokens {
+            built = built.with_max_tokens(max_tokens);
+        }
+        Ok(Arc::new(built) as Arc<dyn ModelProvider>)
+    });
 
     // The screen runs on a blocking thread so the runtime stays free to make
     // the model call while the interface keeps drawing.
@@ -774,6 +859,7 @@ async fn chat(
             target_chains,
             seed,
             record,
+            Some(factory),
         )
     })
     .await
@@ -930,6 +1016,179 @@ async fn bench(
     Ok(())
 }
 
+/// Report what credentials are available and how to get one.
+///
+/// This harness does not implement OAuth. Device flow, PKCE and token refresh
+/// are security-sensitive, and the vendors' own CLIs already do them properly,
+/// so a profile names a command whose output is a token instead.
+fn login() -> Result<()> {
+    use fh::provider::Wire;
+
+    let present = |program: &str| {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {program}")])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    };
+    let set = |name: &str| {
+        std::env::var(name)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    };
+    let mark = |ok: bool| if ok { "yes" } else { "no " };
+
+    println!("This harness never stores a credential. A profile names where to");
+    println!("find one: an environment variable, or a command whose output is a token.");
+    println!();
+
+    println!("anthropic wire");
+    println!(
+        "  ANTHROPIC_API_KEY set      {}",
+        mark(set("ANTHROPIC_API_KEY"))
+    );
+    println!(
+        "  ANTHROPIC_AUTH_TOKEN set   {}",
+        mark(set("ANTHROPIC_AUTH_TOKEN"))
+    );
+    println!("  `ant` CLI installed        {}", mark(present("ant")));
+    println!();
+    println!("  An API key from console.anthropic.com is the simplest:");
+    println!("    export ANTHROPIC_API_KEY=sk-ant-...");
+    println!();
+    println!("  Or sign in with the official CLI and let a profile read the token:");
+    println!("    ant auth login");
+    println!("    fh config add anthropic --wire anthropic \\");
+    println!("        --key-command 'ant auth print-credentials --access-token'");
+    println!();
+
+    println!("openai wire");
+    println!(
+        "  OPENAI_API_KEY set         {}",
+        mark(set("OPENAI_API_KEY"))
+    );
+    println!("  `codex` CLI installed      {}", mark(present("codex")));
+    println!();
+    println!("  Use an API key from platform.openai.com:");
+    println!("    export OPENAI_API_KEY=sk-...");
+    println!("    fh config add openai --wire openai --model gpt-5.2");
+    println!();
+    println!("  A `codex login` with a ChatGPT account authorises the Codex client,");
+    println!("  not arbitrary API clients, so this harness will not read that token");
+    println!("  out of ~/.codex and reuse it. Use an API key for programmatic access.");
+    println!();
+
+    println!("wires available: {}", Wire::names());
+    Ok(())
+}
+
+fn config(action: Option<ConfigAction>) -> Result<()> {
+    use fh::settings::{self, ProviderSettings};
+
+    match action.unwrap_or(ConfigAction::Show) {
+        ConfigAction::List => {
+            let config = settings::load_config();
+            let active = config.active_name();
+            println!("{}", settings::config_path().display());
+            println!();
+            for name in config.names() {
+                println!(
+                    "{} {:<14} {}",
+                    if name == active { "*" } else { " " },
+                    name,
+                    config.summary(&name)
+                );
+            }
+            println!();
+            println!("fh config use <name>                        switch");
+            println!("fh config add <name> --url ... --model ...  create or update");
+        }
+        ConfigAction::Use { name } => {
+            let mut config = settings::load_config();
+            if name != settings::DEFAULT_PROFILE && !config.profiles.contains_key(&name) {
+                return Err(anyhow!(
+                    "no profile '{name}'; you have: {}",
+                    config.names().join(", ")
+                ));
+            }
+            config.active = Some(name.clone());
+            settings::save_config(&config).context("saving")?;
+            println!("now using {name}: {}", config.summary(&name));
+        }
+        ConfigAction::Add { name, provider } => {
+            let wanted = provider.as_settings();
+            if wanted.is_empty() {
+                return Err(anyhow!(
+                    "nothing to set; pass at least one of --url, --model, --api-version, \
+                     --effort or --max-tokens"
+                ));
+            }
+            let mut config = settings::load_config();
+            let merged = config
+                .get(&name)
+                .cloned()
+                .unwrap_or_default()
+                .overlay(&wanted);
+            config.profiles.insert(name.clone(), merged);
+            config.active = Some(name.clone());
+            settings::save_config(&config).context("saving")?;
+            println!("saved profile {name}: {}", config.summary(&name));
+            println!("and switched to it");
+        }
+        ConfigAction::Remove { name } => {
+            let mut config = settings::load_config();
+            if config.profiles.remove(&name).is_none() {
+                return Err(anyhow!("no profile '{name}'"));
+            }
+            if config.active.as_deref() == Some(name.as_str()) {
+                config.active = None;
+            }
+            settings::save_config(&config).context("saving")?;
+            println!("removed {name}; now using {}", config.active_name());
+        }
+        ConfigAction::Show => {
+            let config = settings::load_config();
+            println!("profile      {}", config.active_name());
+            let saved = settings::load();
+            let env = ProviderSettings::from_env();
+            println!("{}", settings::config_path().display());
+            if saved.is_empty() {
+                println!("(nothing saved yet)");
+            }
+            println!();
+            println!("{:<12} {:<34} from", "setting", "value");
+            for line in ProviderSettings::describe(&saved, &env) {
+                println!("{line}");
+            }
+            println!();
+            println!("Credentials are never saved here. Set ANTHROPIC_API_KEY in your");
+            println!("environment; a config file outlives the session and is easy to commit.");
+            println!();
+            println!("fh config set --url https://gateway.example.com --model claude-opus-4-7");
+        }
+        ConfigAction::Set { provider } => {
+            let wanted = provider.as_settings();
+            if wanted.is_empty() {
+                return Err(anyhow!(
+                    "nothing to set; pass at least one of --url, --model, --api-version, \
+                     --effort or --max-tokens"
+                ));
+            }
+            let merged = settings::load().overlay(&wanted);
+            let path = settings::save(&merged).context("saving the settings")?;
+            println!("saved to {}", path.display());
+            for line in ProviderSettings::describe(&merged, &ProviderSettings::default()) {
+                println!("{line}");
+            }
+        }
+        ConfigAction::Clear => {
+            settings::clear().context("clearing the settings")?;
+            println!("cleared {}", settings::config_path().display());
+        }
+    }
+    Ok(())
+}
+
 fn list_chats(show: Option<String>) -> Result<()> {
     let root = fh::history::chat_root();
 
@@ -1011,9 +1270,15 @@ async fn task_from_prose(
 
     println!("model {}", provider.describe());
     println!("asking for a plan...");
-    let plan = fh::plan::draft(&provider, &prose, &binder_chains, &target_chains, seed)
-        .await
-        .map_err(|error| anyhow!("{error}{}", third_party_note(&provider)))?;
+    let plan = fh::plan::draft(
+        provider.as_ref(),
+        &prose,
+        &binder_chains,
+        &target_chains,
+        seed,
+    )
+    .await
+    .map_err(|error| anyhow!("{error}{}", third_party_note(&provider)))?;
 
     println!();
     for line in plan.summary() {
@@ -1200,7 +1465,13 @@ async fn doctor(
             }
             Ok(provider) => {
                 println!("model       {}", provider.describe());
-                println!("            version {}", provider.api_version());
+                println!(
+                    "            wire {}",
+                    effective_settings(&options)
+                        .wire
+                        .unwrap_or_default()
+                        .as_str()
+                );
                 print!("            probing ... ");
                 use std::io::Write;
                 std::io::stdout().flush().ok();

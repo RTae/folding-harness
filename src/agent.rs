@@ -261,6 +261,22 @@ pub trait ModelProvider: Send + Sync {
         ""
     }
 
+    /// Whether this is the vendor's own API rather than a gateway.
+    fn is_first_party(&self) -> bool {
+        true
+    }
+
+    /// One line naming the model and where prompts go, printed before any is
+    /// sent. A provider that reaches a third party should say so.
+    fn describe(&self) -> String {
+        let endpoint = self.endpoint();
+        if endpoint.is_empty() {
+            self.model().to_string()
+        } else {
+            format!("{} via {}", self.model(), endpoint)
+        }
+    }
+
     async fn complete(&self, system: &str, user: &str) -> Result<String, AgentError>;
 
     /// Multi-turn conversation, streaming the reply as it is generated.
@@ -281,6 +297,25 @@ pub trait ModelProvider: Send + Sync {
         let text = self.converse(system, messages).await?;
         let _ = deltas.send(text.clone());
         Ok(text)
+    }
+
+    /// Send a tiny request to confirm the endpoint, credentials and model all
+    /// work together.
+    async fn probe(&self) -> Result<String, AgentError> {
+        const ASK: &str = "Reply with the single word OK.";
+        self.complete(ASK, ASK).await
+    }
+
+    /// The same over the streaming path, reporting how many pieces arrived.
+    /// An endpoint can serve ordinary requests and not support server-sent
+    /// events, which only a streamed request reveals.
+    async fn probe_stream(&self) -> Result<(String, usize), AgentError> {
+        const ASK: &str = "Reply with the single word OK.";
+        let (tx, rx) = std::sync::mpsc::channel();
+        let text = self
+            .converse_stream(ASK, &[ChatMessage::user(ASK)], tx)
+            .await?;
+        Ok((text, rx.into_iter().count()))
     }
 
     /// Multi-turn conversation.

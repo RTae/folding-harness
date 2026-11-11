@@ -27,6 +27,8 @@ pub enum PlanError {
     Provider(#[from] AgentError),
     #[error("the reply contained no JSON object. The model said:\n\n{raw}")]
     NoJson { raw: String },
+    #[error("the reply was cut off before the JSON finished. What arrived:\n\n{raw}")]
+    Truncated { raw: String },
     #[error("the JSON did not match the plan schema: {source}\n\nreply was:\n{raw}")]
     Schema {
         #[source]
@@ -157,6 +159,9 @@ impl PlanError {
     pub fn brief(&self) -> String {
         match self {
             PlanError::NoJson { .. } => "the reply contained no JSON object".to_string(),
+            PlanError::Truncated { .. } => {
+                "the reply was cut off before the JSON finished".to_string()
+            }
             PlanError::Schema { source, .. } => {
                 format!("the JSON did not match the plan schema: {source}")
             }
@@ -168,6 +173,7 @@ impl PlanError {
     /// saying differently: the fix is to ask again, not to argue.
     pub fn looks_truncated(&self) -> bool {
         match self {
+            PlanError::Truncated { .. } => true,
             PlanError::Schema { source, .. } => {
                 let text = source.to_string();
                 text.contains("EOF while parsing") || source.is_eof()
@@ -363,9 +369,28 @@ pub fn plan_from_reply(
     target: &[Chain],
     seed: u64,
 ) -> Result<Plan, PlanError> {
-    let json = extract_json(reply).ok_or_else(|| PlanError::NoJson {
-        raw: reply.trim().chars().take(1500).collect(),
-    })?;
+    let json = match extract_json(reply) {
+        Some(json) => json,
+        None => {
+            let raw: String = reply.trim().chars().take(1500).collect();
+            // An opening brace with nothing to close it means the reply
+            // stopped mid-object. Saying "no JSON object" there is misleading:
+            // there was one, it just never finished.
+            let opened = reply.find('{');
+            let unfinished = match opened {
+                Some(at) => {
+                    let tail = &reply[at..];
+                    tail.len() > 40 && tail.contains('"') && !tail.contains('}')
+                }
+                None => false,
+            };
+            return Err(if unfinished {
+                PlanError::Truncated { raw }
+            } else {
+                PlanError::NoJson { raw }
+            });
+        }
+    };
     let draft: PlanDraft = serde_json::from_str(json).map_err(|source| PlanError::Schema {
         source,
         raw: json.chars().take(1200).collect(),
