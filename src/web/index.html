@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>folding-harness</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <header>
+      <div class="title">
+        <h1>folding&#8209;harness</h1>
+        <select id="runs" aria-label="run"></select>
+        <span id="state" class="pill"></span>
+      </div>
+      <dl id="facts"></dl>
+    </header>
+
+    <main>
+      <section class="panel" id="panel-progress">
+        <h2>Best loss per cycle</h2>
+        <div id="curve"></div>
+        <p class="note" id="curve-note">Waiting for a second completed cycle.</p>
+      </section>
+
+      <section class="panel" id="panel-structure">
+        <h2>
+          Backbone
+          <span class="sub" id="structure-of"></span>
+        </h2>
+        <canvas id="structure" width="520" height="420"></canvas>
+        <p class="note">Drag to rotate, scroll to zoom, double&#8209;click to reset.</p>
+        <ul class="legend">
+          <li><i class="band very-high"></i>very high (&#8805;90)</li>
+          <li><i class="band confident"></i>confident (70&#8211;90)</li>
+          <li><i class="band low"></i>low (50&#8211;70)</li>
+          <li><i class="band very-low"></i>very low (&lt;50)</li>
+          <li><i class="band target"></i>target (fixed)</li>
+        </ul>
+      </section>
+
+      <section class="panel wide" id="panel-population">
+        <h2>Population <span class="sub" id="population-count"></span></h2>
+        <div class="scroll">
+          <table id="population">
+            <thead>
+              <tr>
+                <th>#</th><th>id</th><th>parent</th><th>origin</th>
+                <th>loss</th><th>ipTM</th><th>iface</th><th>clash</th><th>subs</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-sequence">
+        <h2>Sequence <span class="sub" id="sequence-of"></span></h2>
+        <p class="note">
+          Grey is fixed, green may change, yellow changed from the starting
+          sequence.
+        </p>
+        <div id="sequence" class="sequence"></div>
+      </section>
+
+      <section class="panel wide" id="panel-events">
+        <h2>Events <span class="sub" id="event-count"></span></h2>
+        <div class="scroll tall">
+          <ul id="events"></ul>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <p id="disclaimer"></p>
+    </footer>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
