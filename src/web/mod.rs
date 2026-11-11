@@ -300,6 +300,57 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Every element the script looks up has to exist, or a pane silently
+    /// stops updating. The two files are compiled in together, so this can be
+    /// checked at build time rather than discovered in a browser.
+    #[test]
+    fn every_element_the_script_looks_up_exists_in_the_page() {
+        // Ids the script creates itself rather than finding in the page.
+        const GENERATED: &[&str] = &["curve-marker"];
+
+        let mut defined: Vec<&str> = Vec::new();
+        let mut rest = INDEX;
+        while let Some(at) = rest.find("id=\"") {
+            rest = &rest[at + 4..];
+            if let Some(end) = rest.find('"') {
+                defined.push(&rest[..end]);
+                rest = &rest[end..];
+            }
+        }
+
+        let mut looked_up: Vec<&str> = Vec::new();
+        let mut rest = SCRIPT;
+        while let Some(at) = rest.find("el(\"") {
+            rest = &rest[at + 4..];
+            if let Some(end) = rest.find('"') {
+                looked_up.push(&rest[..end]);
+                rest = &rest[end..];
+            }
+        }
+
+        assert!(!looked_up.is_empty(), "the script looks nothing up");
+        for id in &looked_up {
+            assert!(
+                defined.contains(id) || GENERATED.contains(id),
+                "the script looks up '{id}', which the page does not define"
+            );
+        }
+    }
+
+    #[test]
+    fn the_page_loads_the_assets_this_server_serves() {
+        assert!(INDEX.contains("/app.js"), "the page never loads the script");
+        assert!(
+            INDEX.contains("/app.css"),
+            "the page never loads the styles"
+        );
+        // And the routes exist for both.
+        let routes = [("/app.js", SCRIPT), ("/app.css", STYLE)];
+        for (path, body) in routes {
+            assert!(!body.is_empty(), "{path} is empty");
+        }
+    }
+
     #[tokio::test]
     async fn the_page_and_its_assets_are_served_with_their_types() {
         // The assets are compiled in, so this also proves they exist.

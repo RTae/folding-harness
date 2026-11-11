@@ -371,10 +371,22 @@ so there is still no Node, no asset directory and no build step. The server
 only reads the task directory, so having the page open cannot disturb a run,
 and a run does not need the page.
 
-It shows the run picker, the loss curve, the retained population, the sequence
-with its fixed, mutable and changed residues, the event stream, and the
-backbone on a canvas you can drag to rotate and scroll to zoom. While a run is
-live the page polls every 1.5 seconds and stops when the run finishes.
+Panes: the loss curve with best and mean and a band between them, hover for
+the cycle behind any point; a per-cycle strip of admitted against rejected; the
+retained population; a lineage tree whose nodes are coloured green through red
+by loss and which you can click to select; the loss broken down by term; the
+sequence with its fixed, mutable and changed residues; the event stream; and
+the backbone.
+
+The backbone canvas drags to rotate, scrolls to zoom, and has a spin toggle.
+Four colour modes answer different questions: **confidence** is the usual
+pLDDT banding, **changed residues** shows in 3D which positions differ from the
+starting sequence, **mutable scope** shows which the config allows to change at
+all, and **chain** separates binder from target. The canvas is sized to the
+display's pixel density, so it is crisp rather than upscaled.
+
+While a run is live the page polls every 1.5 seconds and stops when the run
+finishes.
 
 The server resolves the mutable scope itself and sends the browser one boolean
 per residue, so the page never parses a task config. One definition of the
