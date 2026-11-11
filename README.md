@@ -5,13 +5,14 @@ around a structure-prediction backend, and the backend sits behind a versioned
 HTTP contract.
 
 It ships a deterministic fixture backend, so the whole loop runs on a laptop
-with no GPU and no network. It also ships two terminal interfaces: a dashboard
-for watching a run over SSH without forwarding a port, and a chat screen for
-setting a run up by describing it.
+with no GPU and no network. It has three interfaces: a terminal dashboard for
+watching a run over SSH without forwarding a port, a terminal chat screen for
+setting a run up by describing it, and a local web view for when a browser
+renders better than a terminal does.
 
 > **Status: working proof of concept.** The cycle, the contract, the gates, the
-> population, the trace, the manifest, the dashboard and the chat screen are
-> implemented, and 106 tests pass. `fh run` completes end to end both in-process
+> population, the trace, the manifest, the dashboard, the chat screen, the web
+> view and the chat history are implemented, and 119 tests pass. `fh run` completes end to end both in-process
 > and over HTTP, and produces the identical run either way.
 >
 > Not done yet: the model-backed skills, inverse folding and likelihood-guided
@@ -107,9 +108,13 @@ fh chat --binder binder.fasta --target target.fasta
 Enter send   Ctrl-R run   F1 or /help for keys   PgUp/PgDn scroll   Esc quit
 ```
 
-Replies stream in as the model writes them. The message line is a real editor.
-Left and Right and Home and End move the cursor, Ctrl-W deletes a word, Ctrl-U
-clears the line, and Up and Down recall earlier messages. The slash commands
+Replies stream in as the model writes them. The message box is a real editor
+and takes several lines. Enter sends, Alt-Enter adds a line, and a paste of
+several lines stays one message, because the screen turns on bracketed paste
+and reads a paste as one event rather than as a burst of Enter presses. Left
+and Right and Home and End move within a line, Ctrl-W deletes a word, Ctrl-U
+clears the message, and Up and Down move between lines or recall earlier
+messages. The slash commands
 `/help`, `/plan`, `/run`, `/save [path]`, `/model`, `/clear` and `/quit` run
 locally and never reach the model. `F1` prints the same list as `/help`.
 
@@ -237,7 +242,7 @@ candidate rather than weighted away.
 ```
 ~/.folding_harness/tasks/<task-id>/
   task.yaml          resolved config, as used
-  run.json           manifest: seed, backend, model, protocol, config SHA-256
+  run.json           manifest: seed, backend, model, protocol, config SHA-256, chat id
   trace.jsonl        every event, in order, flushed per line
   population.json    current members, loss curve, per-cycle records
   best.json          best candidate
@@ -288,6 +293,77 @@ fh board --snapshot --keys                             # print the key list
 Colour carries the confidence bands in the live pane and a snapshot drops it.
 The braille still carries the shape.
 
+## Measuring the search
+
+`fh bench` asks whether a search policy works, which a loss curve going down
+does not answer:
+
+```bash
+fh bench                                  # all policies, 5 seeds
+fh bench --seeds 24 --cycles 30
+fh bench --policy heuristic --policy random --json out.json
+```
+
+The fixture plants an optimum derived from the seed, so unlike a real run this
+one has ground truth. The benchmark reports **recovery**: the share of planted
+positions the best candidate actually found. `random`, which draws uniformly
+from the legal skills, is the control, and `founder-only` folds the starting
+sequence and stops, which is the floor.
+
+What it measures is orchestration against a synthetic landscape. It says
+nothing about whether a design would bind, and it cannot, because the fixture
+does not fold.
+
+## The web view
+
+`fh web` serves the same recorded runs in a browser, for when pixels beat
+braille:
+
+```bash
+fh web                      # http://127.0.0.1:8750
+fh web --port 9000 --task-root ./runs
+```
+
+It binds to loopback only, because it serves local run data and authenticates
+nobody. The page, its stylesheet and its script are compiled into the binary,
+so there is still no Node, no asset directory and no build step. The server
+only reads the task directory, so having the page open cannot disturb a run,
+and a run does not need the page.
+
+It shows the run picker, the loss curve, the retained population, the sequence
+with its fixed, mutable and changed residues, the event stream, and the
+backbone on a canvas you can drag to rotate and scroll to zoom. While a run is
+live the page polls every 1.5 seconds and stops when the run finishes.
+
+The server resolves the mutable scope itself and sends the browser one boolean
+per residue, so the page never parses a task config. One definition of the
+scope, in Rust, shared by both interfaces.
+
+## Chat history
+
+Every conversation is saved after each exchange, so closing the terminal does
+not lose it:
+
+```bash
+fh chats                       # list saved chats
+fh chats --show <id>           # print one transcript
+fh chat --continue             # carry on the most recent
+fh chat --resume <id>          # carry on a particular one
+```
+
+Resuming reuses the sequences stored with the chat, so `--binder` and
+`--target` are only needed for a fresh one. A resumed chat re-derives its plan
+from the last reply rather than trusting a stored verdict, so the same
+validation applies either way.
+
+A run started from a chat is linked in both directions: the chat record lists
+the task ids it produced, and the run's `run.json` carries the `chat_id`. That
+answers "which conversation asked for this run" from either end.
+
+Chat records live in `~/.folding_harness/chats`, or `$FH_CHAT_ROOT`. They
+contain the sequences you supplied, the same material the task config already
+stores beside each run.
+
 ## The compute contract
 
 `src/contract.rs` is the whole protocol and depends only on `serde`, so a
@@ -330,6 +406,9 @@ no Node, and no second runtime.
 | `src/plan.rs` | prose to a validated task config |
 | `src/fasta.rs` | a minimal FASTA reader |
 | `src/trace.rs` | event log, task directory layout, run manifest |
+| `src/history.rs` | saved chats, and the link between a chat and its runs |
+| `src/bench.rs` | policy comparison against the fixture's planted optimum |
+| `src/web/` | the local web view: `mod.rs`, plus the page, script and stylesheet |
 | `src/orchestrator.rs` | the cycle |
 | `src/tui/` | the dashboard, `chat.rs`, and `structure.rs` for the backbone projection |
 | `src/main.rs` | the `fh` command |

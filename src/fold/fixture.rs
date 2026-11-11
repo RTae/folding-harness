@@ -161,6 +161,42 @@ impl FixtureBackend {
         matched as f64 / total as f64
     }
 
+    /// How much of the planted optimum a sequence has recovered, 0..1.
+    ///
+    /// The fixture knows the answer it planted, so this is the one score in
+    /// the project that can be checked against ground truth. It is what makes
+    /// `fh bench` able to say whether a search policy actually works, rather
+    /// than only that it produced a number.
+    ///
+    /// Returns `None` when nothing was planted, since then there is nothing to
+    /// recover.
+    pub fn recovery(&self, chains: &[(String, String)]) -> Option<f64> {
+        let mut matched = 0usize;
+        let mut total = 0usize;
+        for (label, sequence) in chains {
+            let Some(plant) = self.plants.get(label) else {
+                continue;
+            };
+            let residues: Vec<char> = sequence.chars().collect();
+            for (position, wanted) in &plant.ideal {
+                total += 1;
+                if residues.get(*position).copied() == Some(*wanted) {
+                    matched += 1;
+                }
+            }
+        }
+        if total == 0 {
+            None
+        } else {
+            Some(matched as f64 / total as f64)
+        }
+    }
+
+    /// Number of planted positions, which is the most a run could recover.
+    pub fn planted_positions(&self) -> usize {
+        self.plants.values().map(|plant| plant.ideal.len()).sum()
+    }
+
     fn designed_text(job: &JobSpec) -> String {
         job.chains
             .iter()

@@ -197,9 +197,37 @@ impl Orchestrator {
         CandidateId(self.next_id)
     }
 
-    pub async fn run(&mut self) -> Result<RunSummary, RunError> {
+    /// Fold the input sequence and stop, without searching.
+    ///
+    /// The control arm of a benchmark: it shows what the starting sequence
+    /// scores, so a search can be compared against doing nothing.
+    pub async fn seed_founder_only(&mut self) -> Result<RunSummary, RunError> {
         let started = Instant::now();
+        self.announce()?;
+        self.seed_founder().await?;
 
+        let best = self.population.best().cloned();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        self.emit(Event::TaskFinished {
+            cycles_completed: 0,
+            folds: self.folds,
+            best: best.as_ref().map(|candidate| candidate.id),
+            best_loss: best.as_ref().and_then(|candidate| candidate.loss),
+            elapsed_ms,
+        })?;
+        self.snapshot(0, false)?;
+
+        Ok(RunSummary {
+            task_id: self.task_id.clone(),
+            root: self.paths.root().to_path_buf(),
+            cycles_completed: 0,
+            folds: self.folds,
+            best,
+            elapsed_ms,
+        })
+    }
+
+    fn announce(&mut self) -> Result<(), RunError> {
         self.emit(Event::TaskStarted {
             task_id: self.task_id.0.clone(),
             name: self.config.name.clone(),
@@ -210,7 +238,12 @@ impl Orchestrator {
             seed: self.config.design.seed,
             scope: self.scope.summary(),
             gates: format!("{:?}", self.config.gates),
-        })?;
+        })
+    }
+
+    pub async fn run(&mut self) -> Result<RunSummary, RunError> {
+        let started = Instant::now();
+        self.announce()?;
 
         match self.seed_founder().await {
             Ok(()) => {}

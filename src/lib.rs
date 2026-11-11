@@ -28,6 +28,7 @@
 //! * [`tui`] — the terminal dashboard.
 
 pub mod agent;
+pub mod bench;
 pub mod candidate;
 pub mod config;
 pub mod contract;

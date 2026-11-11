@@ -147,6 +147,36 @@ impl PlanDraft {
     }
 }
 
+impl PlanError {
+    /// The error without the echoed reply.
+    ///
+    /// `Display` repeats the model's reply, which is what you want on the
+    /// command line where the reply is otherwise invisible. In the chat screen
+    /// the reply is already on screen, so repeating it buries the one line
+    /// that says what went wrong.
+    pub fn brief(&self) -> String {
+        match self {
+            PlanError::NoJson { .. } => "the reply contained no JSON object".to_string(),
+            PlanError::Schema { source, .. } => {
+                format!("the JSON did not match the plan schema: {source}")
+            }
+            other => other.to_string(),
+        }
+    }
+
+    /// Whether the reply looks cut off rather than wrong, which is worth
+    /// saying differently: the fix is to ask again, not to argue.
+    pub fn looks_truncated(&self) -> bool {
+        match self {
+            PlanError::Schema { source, .. } => {
+                let text = source.to_string();
+                text.contains("EOF while parsing") || source.is_eof()
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A validated plan: the config, and what it resolves to.
 #[derive(Debug)]
 pub struct Plan {
@@ -240,6 +270,8 @@ Hard rules:
 choose parameters. There is no sequence field in the schema and you must not add one.
 - Residue positions are ONE-BASED and INCLUSIVE, and must lie inside the binder chain whose \
 label you name. You are told each chain's length; a region beyond it is rejected.
+- `regions` must list at least one region. An empty list leaves nothing to
+design and is rejected.
 - Regions must not overlap. Only binder chains can have regions.
 - `fixed_residues` pins positions that fall INSIDE a region, written \"LABEL:POSITION\". Use it \
 for residues the user says to keep.

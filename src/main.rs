@@ -211,6 +211,22 @@ enum Command {
     Skills,
     /// List recorded runs.
     Ls,
+    /// Measure search policies against the fixture's planted optimum.
+    Bench {
+        /// Task config to benchmark. Defaults to the built-in example.
+        task: Option<PathBuf>,
+        /// How many seeds to run per policy.
+        #[arg(long, default_value_t = 5)]
+        seeds: u64,
+        #[arg(long, default_value_t = 20)]
+        cycles: u32,
+        /// Policies to compare. Defaults to all of them.
+        #[arg(long)]
+        policy: Vec<String>,
+        /// Write the raw outcomes here as JSON.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
     /// List saved chats.
     Chats {
         /// Print the whole transcript of one chat.
@@ -321,6 +337,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Ls => list_runs(),
+        Command::Bench {
+            task,
+            seeds,
+            cycles,
+            policy,
+            json,
+        } => bench(task, seeds, cycles, policy, json).await,
         Command::Chats { show } => list_chats(show),
     }
 }
@@ -768,6 +791,143 @@ async fn chat(
             run_config(config, task_root, true, latency, Some(chat_id)).await
         }
     }
+}
+
+async fn bench(
+    task: Option<PathBuf>,
+    seeds: u64,
+    cycles: u32,
+    policy: Vec<String>,
+    json: Option<PathBuf>,
+) -> Result<()> {
+    use fh::bench::{self, Policy};
+
+    let config = match &task {
+        Some(path) => {
+            TaskConfig::load(path).with_context(|| format!("loading {}", path.display()))?
+        }
+        None => TaskConfig::from_yaml(EXAMPLE_TASK).context("the built-in example")?,
+    };
+
+    let policies: Vec<Policy> = if policy.is_empty() {
+        Policy::ALL.to_vec()
+    } else {
+        policy
+            .iter()
+            .map(|name| {
+                Policy::parse(name)
+                    .ok_or_else(|| anyhow!("no policy '{name}'; choose from: {}", Policy::names()))
+            })
+            .collect::<Result<_>>()?
+    };
+
+    let seed_list: Vec<u64> = (0..seeds.max(1)).map(|index| 1000 + index).collect();
+    let root = std::env::temp_dir().join(format!("fh-bench-{}", fh::trace::now_ms()));
+
+    println!(
+        "{} policies x {} seeds x {} cycles, against the fixture's planted optimum",
+        policies.len(),
+        seed_list.len(),
+        cycles
+    );
+    println!("recovery is the share of planted positions the best candidate found");
+    println!();
+
+    let total = policies.len() * seed_list.len();
+    let mut done = 0usize;
+    // Overwrite one line on a terminal; print a line each on a pipe, where
+    // carriage returns would run the whole sweep together.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let outcomes = bench::sweep(&config, &policies, &seed_list, cycles, &root, |outcome| {
+        done += 1;
+        use std::io::Write;
+        if interactive {
+            print!(
+                "\r  {done}/{total}  {} seed {} recovery {:.0}%          ",
+                outcome.policy,
+                outcome.seed,
+                outcome.recovery * 100.0
+            );
+            std::io::stdout().flush().ok();
+        } else {
+            println!(
+                "  {done}/{total}  {} seed {} recovery {:.0}%",
+                outcome.policy,
+                outcome.seed,
+                outcome.recovery * 100.0
+            );
+        }
+    })
+    .await
+    .map_err(|error| anyhow!("{error}"))?;
+    if interactive {
+        println!("\r{:<62}", "");
+    } else {
+        println!();
+    }
+
+    println!(
+        "{:<14} {:>5} {:>10} {:>10} {:>10} {:>8} {:>12}",
+        "policy", "runs", "recovery", "worst", "best", "folds", "per 1k folds"
+    );
+    let mut baseline: Option<f64> = None;
+    for policy in &policies {
+        let mine: Vec<_> = outcomes
+            .iter()
+            .filter(|outcome| outcome.policy == policy.as_str())
+            .cloned()
+            .collect();
+        let summary = bench::summarise(*policy, &mine);
+        if *policy == Policy::Random {
+            baseline = Some(summary.mean_recovery);
+        }
+        println!(
+            "{:<14} {:>5} {:>9.1}% {:>9.1}% {:>9.1}% {:>8.0} {:>12.2}",
+            summary.policy,
+            summary.runs,
+            summary.mean_recovery * 100.0,
+            summary.worst_recovery * 100.0,
+            summary.best_recovery * 100.0,
+            summary.mean_folds,
+            summary.recovery_per_1k_folds
+        );
+    }
+
+    if let Some(random) = baseline {
+        let heuristic = outcomes
+            .iter()
+            .filter(|outcome| outcome.policy == "heuristic")
+            .map(|outcome| outcome.recovery)
+            .collect::<Vec<_>>();
+        if !heuristic.is_empty() {
+            let mean = heuristic.iter().sum::<f64>() / heuristic.len() as f64;
+            println!();
+            if random <= f64::EPSILON {
+                println!("the random control recovered nothing, so there is no ratio to report");
+            } else {
+                println!(
+                    "the shipped policy recovers {:.2}x what a uniform draw does",
+                    mean / random
+                );
+            }
+            if mean <= random {
+                println!("it is not beating the control, which is worth looking into");
+            }
+        }
+    }
+
+    if let Some(path) = json {
+        fh::trace::write_json(&path, &outcomes)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!();
+        println!("raw outcomes written to {}", path.display());
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+    println!();
+    println!("This measures orchestration against a synthetic landscape.");
+    println!("It says nothing about whether a design would bind.");
+    Ok(())
 }
 
 fn list_chats(show: Option<String>) -> Result<()> {

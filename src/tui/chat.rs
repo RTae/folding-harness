@@ -23,6 +23,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::crossterm::event::{
     self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
+use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -170,6 +171,99 @@ impl TextInput {
         self.cursor += 1;
     }
 
+    /// Insert pasted text at the cursor, newlines and all.
+    ///
+    /// A paste arrives as one event when the terminal has bracketed paste, so
+    /// its newlines are content rather than a run of Enter presses. One
+    /// trailing newline is dropped: copying a line usually takes its line
+    /// ending with it, and nobody means to end on a blank line.
+    fn insert_str(&mut self, text: &str) {
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        let text = text.strip_suffix('\r').unwrap_or(text);
+        for character in text.chars() {
+            // Carriage returns and tabs would corrupt the layout.
+            match character {
+                '\r' => continue,
+                '\t' => {
+                    for _ in 0..4 {
+                        self.insert(' ');
+                    }
+                }
+                _ => self.insert(character),
+            }
+        }
+    }
+
+    /// The logical lines of the buffer.
+    fn lines(&self) -> Vec<String> {
+        self.text()
+            .split('\n')
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    fn line_count(&self) -> usize {
+        1 + self.chars.iter().filter(|c| **c == '\n').count()
+    }
+
+    /// Where the cursor sits, as a line and a column within it.
+    fn row_col(&self) -> (usize, usize) {
+        let mut row = 0;
+        let mut col = 0;
+        for character in self.chars.iter().take(self.cursor) {
+            if *character == '\n' {
+                row += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (row, col)
+    }
+
+    /// Index of the first character of a given line.
+    fn line_start(&self, row: usize) -> usize {
+        let mut seen = 0;
+        for (index, character) in self.chars.iter().enumerate() {
+            if seen == row {
+                return index;
+            }
+            if *character == '\n' {
+                seen += 1;
+            }
+        }
+        self.chars.len()
+    }
+
+    fn line_len(&self, row: usize) -> usize {
+        self.lines()
+            .get(row)
+            .map(|line| line.chars().count())
+            .unwrap_or(0)
+    }
+
+    /// Up and Down move between lines when the message has several, and
+    /// otherwise walk the history, which is what a shell does.
+    fn up(&mut self) {
+        let (row, col) = self.row_col();
+        if row == 0 {
+            self.recall_older();
+            return;
+        }
+        let target = row - 1;
+        self.cursor = self.line_start(target) + col.min(self.line_len(target));
+    }
+
+    fn down(&mut self) {
+        let (row, col) = self.row_col();
+        if row + 1 >= self.line_count() {
+            self.recall_newer();
+            return;
+        }
+        let target = row + 1;
+        self.cursor = self.line_start(target) + col.min(self.line_len(target));
+    }
+
     fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
@@ -204,11 +298,13 @@ impl TextInput {
     }
 
     fn home(&mut self) {
-        self.cursor = 0;
+        let (row, _) = self.row_col();
+        self.cursor = self.line_start(row);
     }
 
     fn end(&mut self) {
-        self.cursor = self.chars.len();
+        let (row, _) = self.row_col();
+        self.cursor = self.line_start(row) + self.line_len(row);
     }
 
     fn clear(&mut self) {
@@ -270,16 +366,35 @@ impl TextInput {
         }
     }
 
-    /// The visible slice and the cursor's column within it, for a given width.
-    fn view(&self, width: usize) -> (String, usize) {
+    /// The lines to draw and where the cursor sits among them.
+    ///
+    /// Only the cursor's own line scrolls horizontally, so the rest stay put
+    /// while you move along a long line.
+    fn view(&self, width: usize, max_rows: usize) -> (Vec<String>, usize, usize) {
         let width = width.max(4);
-        if self.chars.len() < width {
-            return (self.text(), self.cursor);
+        let max_rows = max_rows.max(1);
+        let lines = self.lines();
+        let (row, col) = self.row_col();
+
+        // Scroll vertically so the cursor's line is on screen.
+        let first = if row >= max_rows {
+            row + 1 - max_rows
+        } else {
+            0
+        };
+        let visible: Vec<String> = lines.iter().skip(first).take(max_rows).cloned().collect();
+
+        let cursor_row = row - first;
+        let mut shown = visible;
+        let mut cursor_col = col;
+        if let Some(line) = shown.get_mut(cursor_row) {
+            if line.chars().count() >= width {
+                let start = col.saturating_sub(width - 1);
+                *line = line.chars().skip(start).take(width).collect();
+                cursor_col = col - start;
+            }
         }
-        // Keep the cursor in view, scrolling horizontally.
-        let start = self.cursor.saturating_sub(width - 1);
-        let text: String = self.chars[start..].iter().take(width).collect();
-        (text, self.cursor - start)
+        (shown, cursor_row, cursor_col)
     }
 }
 
@@ -287,6 +402,7 @@ impl TextInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Slash {
     Help,
+    Retry,
     Run,
     Save(Option<String>),
     Plan,
@@ -304,6 +420,7 @@ fn parse_slash(line: &str) -> Option<Slash> {
     let argument = parts.next().map(|text| text.trim().to_string());
     Some(match name.as_str() {
         "help" | "h" | "?" => Slash::Help,
+        "retry" => Slash::Retry,
         "run" | "r" => Slash::Run,
         "save" | "s" => Slash::Save(argument.filter(|text| !text.is_empty())),
         "plan" | "p" => Slash::Plan,
@@ -315,6 +432,7 @@ fn parse_slash(line: &str) -> Option<Slash> {
 }
 
 const HELP: &str = "/help           this list
+/retry          ask again, for a reply that was cut off
 /plan           show the current plan summary again
 /run            run the validated plan (same as Ctrl-R)
 /save [path]    write the plan to task.yaml, or to [path]
@@ -322,9 +440,10 @@ const HELP: &str = "/help           this list
 /clear          forget the conversation so far and start over
 /quit           leave without running (same as Esc)
 
-Enter sends. Left/Right and Home/End move the cursor, Ctrl-W deletes a word,
-Ctrl-U clears the line, Up/Down recall what you typed before. PgUp/PgDn scroll
-the transcript.";
+Enter sends, Alt-Enter adds a line. Pasting several lines keeps them as one
+message. Left/Right and Home/End move within a line, Ctrl-W deletes a word,
+Ctrl-U clears the message, Up/Down move between lines or recall what you typed
+before. PgUp/PgDn scroll the transcript.";
 
 pub struct ChatApp {
     provider: Arc<dyn ModelProvider>,
@@ -536,6 +655,7 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
                     self.note(summary);
                 }
             },
+            Slash::Retry => self.retry(),
             Slash::Run => self.confirm_plan(),
             Slash::Save(path) => self.save(path.as_deref()),
             Slash::Unknown(name) => {
@@ -543,6 +663,20 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
                 self.note(text);
             }
         }
+    }
+
+    /// Ask again without adding a message, for a reply that was cut off.
+    fn retry(&mut self) {
+        if self.waiting.is_some() {
+            self.status = "still waiting for the last reply".to_string();
+            return;
+        }
+        if self.history.is_empty() {
+            self.status = "nothing to retry yet".to_string();
+            return;
+        }
+        self.note("Asking again.");
+        self.ask();
     }
 
     /// Start a streaming request for the current history.
@@ -692,14 +826,26 @@ task.yaml, or keep talking to change it."
                 // Conversation without a plan in it is normal.
             }
             Err(error) => {
-                let detail = error.to_string();
-                self.plan_error = Some(detail.clone());
-                self.note(format!(
-                    "That plan did not validate, so it was not accepted:\n\n{detail}"
-                ));
-                // Tell the model what was wrong, so the next turn can fix it.
+                // The reply is already in the transcript above, so the note and
+                // the plan pane show the reason only.
+                let brief = error.brief();
+                self.plan_error = Some(brief.clone());
+
+                if error.looks_truncated() {
+                    self.note(format!(
+                        "That plan was cut off before it finished, so it was not accepted:\n\n\
+{brief}\n\nType /retry to ask again."
+                    ));
+                } else {
+                    self.note(format!(
+                        "That plan did not validate, so it was not accepted:\n\n{brief}"
+                    ));
+                }
+
+                // The model is told the full error, including its own reply, so
+                // it can see exactly where the problem was.
                 self.history.push(ChatMessage::user(format!(
-                    "The harness rejected that plan: {detail}\nReply with corrected plan JSON."
+                    "The harness rejected that plan: {error}\nReply with corrected plan JSON."
                 )));
             }
         }
@@ -733,6 +879,19 @@ task.yaml, or keep talking to change it."
         }
     }
 
+    /// Pasted text arrives whole, so its newlines never read as Enter.
+    pub fn on_paste(&mut self, text: &str) {
+        if self.waiting.is_some() {
+            self.status = "still waiting for the last reply".to_string();
+            return;
+        }
+        self.input.insert_str(text);
+        let lines = text.lines().count();
+        if lines > 1 {
+            self.status = format!("pasted {lines} lines; Enter sends, Alt-Enter adds a line");
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -753,6 +912,14 @@ task.yaml, or keep talking to change it."
             return;
         }
 
+        // Alt-Enter adds a line instead of sending, for writing a long message
+        // by hand. Most terminals cannot distinguish Shift-Enter, so Alt is
+        // the one that works widely.
+        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Enter {
+            self.input.insert('\n');
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => self.quit = true,
             // `?` is a character you might want to type, so the shortcut is
@@ -765,8 +932,8 @@ task.yaml, or keep talking to change it."
             KeyCode::Right => self.input.right(),
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
-            KeyCode::Up => self.input.recall_older(),
-            KeyCode::Down => self.input.recall_newer(),
+            KeyCode::Up => self.input.up(),
+            KeyCode::Down => self.input.down(),
             KeyCode::PageUp => {
                 self.follow = false;
                 self.scroll = self.scroll.saturating_sub(8);
@@ -788,7 +955,7 @@ task.yaml, or keep talking to change it."
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(6),
-                Constraint::Length(3),
+                Constraint::Length(self.input_height()),
                 Constraint::Length(1),
             ])
             .split(columns[0]);
@@ -889,32 +1056,59 @@ task.yaml, or keep talking to change it."
         );
     }
 
+    /// How tall the message box wants to be, borders included.
+    fn input_height(&self) -> u16 {
+        const MAX_ROWS: usize = 8;
+        2 + self.input.line_count().clamp(1, MAX_ROWS) as u16
+    }
+
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
         let busy = self.waiting.is_some();
         let inner_width = area.width.saturating_sub(4) as usize;
-        let (shown, cursor_column) = self.input.view(inner_width);
+        let rows = area.height.saturating_sub(2) as usize;
+        let (lines, cursor_row, cursor_col) = self.input.view(inner_width, rows);
 
-        let (text, style) = if busy && self.input.is_empty() {
-            (
-                "waiting for the model…".to_string(),
-                Style::default().fg(Color::Gray),
-            )
+        let title = if self.input.line_count() > 1 {
+            format!(" message \u{2014} {} lines ", self.input.line_count())
         } else {
-            (shown, Style::default().fg(Color::White))
+            " message ".to_string()
+        };
+
+        let body: Vec<Line> = if busy && self.input.is_empty() {
+            vec![Line::from(vec![
+                Span::styled("> ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    "waiting for the model\u{2026}",
+                    Style::default().fg(Color::Gray),
+                ),
+            ])]
+        } else {
+            lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    Line::from(vec![
+                        Span::styled(
+                            if index == 0 { "> " } else { "  " },
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(line.clone(), Style::default().fg(Color::White)),
+                    ])
+                })
+                .collect()
         };
 
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("> ", Style::default().fg(Color::Cyan)),
-                Span::styled(text, style),
-            ]))
-            .block(Block::default().borders(Borders::ALL).title(" message ")),
+            Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(title)),
             area,
         );
 
         if !busy || !self.input.is_empty() {
             // +1 for the border, +2 for the "> " prompt.
-            frame.set_cursor_position(Position::new(area.x + 3 + cursor_column as u16, area.y + 1));
+            frame.set_cursor_position(Position::new(
+                area.x + 3 + cursor_col as u16,
+                area.y + 1 + cursor_row as u16,
+            ));
         }
     }
 
@@ -1045,13 +1239,20 @@ pub fn run(
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Bracketed paste makes the terminal wrap a paste in markers, so it
+    // arrives as one event rather than as a burst of keystrokes with every
+    // newline read as Enter.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let outcome = event_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     outcome?;
@@ -1065,8 +1266,10 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut ChatApp) -> io::
 
         // Short poll so streamed text appears promptly.
         if event::poll(Duration::from_millis(40))? {
-            if let TermEvent::Key(key) = event::read()? {
-                app.on_key(key);
+            match event::read()? {
+                TermEvent::Key(key) => app.on_key(key),
+                TermEvent::Paste(text) => app.on_paste(&text),
+                _ => {}
             }
         }
 
@@ -1299,6 +1502,99 @@ mod tests {
     }
 
     #[test]
+    fn a_pasted_block_is_one_message_not_many() {
+        // The bug this fixes: a multi-line paste used to read as a burst of
+        // Enter presses, sending the first line and stranding the rest.
+        let mut app = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async { app_with("") });
+        app.on_paste("first line\nsecond line\nthird line\n");
+
+        assert_eq!(app.input.line_count(), 3, "{:?}", app.input.text());
+        assert_eq!(app.input.text(), "first line\nsecond line\nthird line");
+        assert!(app.history.is_empty(), "nothing should have been sent");
+        assert!(app.waiting.is_none(), "no request should have started");
+        assert!(app.status.contains("3 lines"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_paste_keeps_its_shape_and_drops_only_a_trailing_newline() {
+        let mut input = TextInput::default();
+        input.insert_str("a\nb\n");
+        assert_eq!(input.text(), "a\nb");
+
+        // Carriage returns are dropped and tabs become spaces, so neither
+        // corrupts the layout.
+        let mut windows = TextInput::default();
+        windows.insert_str("one\r\ntwo\r\n");
+        assert_eq!(windows.text(), "one\ntwo");
+
+        let mut tabbed = TextInput::default();
+        tabbed.insert_str("a\tb");
+        assert_eq!(tabbed.text(), "a    b");
+    }
+
+    #[test]
+    fn the_cursor_walks_a_multi_line_message() {
+        let mut input = TextInput::default();
+        input.insert_str("alpha\nbe\ngamma");
+        assert_eq!(input.line_count(), 3);
+
+        input.home();
+        // Cursor is on the last line, at its start.
+        assert_eq!(input.row_col(), (2, 0));
+
+        input.up();
+        assert_eq!(input.row_col(), (1, 0));
+        input.end();
+        assert_eq!(input.row_col(), (1, 2), "end of the short middle line");
+
+        // Moving up from a short line clamps to the longer line's end.
+        input.up();
+        let (row, col) = input.row_col();
+        assert_eq!(row, 0);
+        assert!(col <= 5);
+
+        input.down();
+        assert_eq!(input.row_col().0, 1);
+    }
+
+    #[test]
+    fn up_recalls_history_only_on_the_first_line() {
+        let mut input = TextInput::default();
+        input.set("remembered");
+        input.take();
+
+        // Single line: Up walks the history.
+        input.up();
+        assert_eq!(input.text(), "remembered");
+
+        // Several lines: Up moves within the message instead.
+        input.clear();
+        input.insert_str("one\ntwo");
+        input.up();
+        assert_eq!(
+            input.text(),
+            "one\ntwo",
+            "history must not overwrite a draft"
+        );
+        assert_eq!(input.row_col().0, 0);
+    }
+
+    #[test]
+    fn the_box_grows_with_the_message_and_stops_growing() {
+        let mut input = TextInput::default();
+        assert_eq!(input.line_count(), 1);
+        input.insert_str(&"x\n".repeat(20));
+        assert_eq!(input.line_count(), 20);
+
+        // The view shows a window of the lines, not all twenty.
+        let (lines, row, _) = input.view(40, 8);
+        assert_eq!(lines.len(), 8);
+        assert!(row < 8, "the cursor must stay on screen");
+    }
+
+    #[test]
     fn the_visible_window_follows_the_cursor() {
         let mut input = TextInput::default();
         for character in "abcdefghijklmnop".chars() {
@@ -1307,24 +1603,25 @@ mod tests {
         // At the end of a long line the tail is visible and the cursor sits
         // just past it — the cursor takes a column of its own, so the text is
         // at most width-1 characters.
-        let (text, column) = input.view(8);
+        let (lines, _, column) = input.view(8, 1);
+        let text = &lines[0];
         assert!(text.chars().count() <= 8, "{text:?}");
         assert!(text.ends_with('p'), "{text}");
         assert!(column < 8, "cursor column {column} is off-pane");
         assert_eq!(column, text.chars().count());
 
         input.home();
-        let (text, column) = input.view(8);
-        assert!(text.starts_with('a'), "{text}");
+        let (lines, _, column) = input.view(8, 1);
+        assert!(lines[0].starts_with('a'), "{:?}", lines[0]);
         assert_eq!(column, 0);
 
         // Somewhere in the middle, the cursor is still on-pane.
         for _ in 0..6 {
             input.right();
         }
-        let (text, column) = input.view(8);
+        let (lines, _, column) = input.view(8, 1);
         assert!(column < 8, "cursor column {column} is off-pane");
-        assert!(!text.is_empty());
+        assert!(!lines[0].is_empty());
     }
 
     #[test]
@@ -1463,6 +1760,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rejected_plan_does_not_repeat_the_reply_on_screen() {
+        let mut app = app_with("");
+        // A long reply that fails the schema. The transcript already holds it,
+        // so neither the note nor the plan pane should echo it again.
+        let reply = format!(
+            "{{\"topology\":\"vhh\",\"regions\":[],\"notes\":\"{}\"}}",
+            "x".repeat(600)
+        );
+        app.validate(&reply);
+
+        let shown = app.plan_error.clone().expect("an error is shown");
+        assert!(
+            !shown.contains("xxxxx"),
+            "the plan pane repeated the reply: {shown}"
+        );
+        assert!(shown.len() < 200, "the error should be one line: {shown}");
+
+        let (_, note) = app.transcript.last().expect("a harness note");
+        assert!(!note.contains("xxxxx"), "the note repeated the reply");
+
+        // The model still gets the full error, reply included, so it can fix it.
+        let told = &app.history.last().expect("told the model").text;
+        assert!(told.contains("rejected"), "{told}");
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_plan_says_so_and_offers_retry() {
+        let mut app = app_with("");
+        // Valid as far as it goes, then the stream stopped.
+        app.validate("{\"topology\": \"vhh\", \"regions\": [");
+
+        let note = &app.transcript.last().expect("a note").1;
+        assert!(note.contains("cut off"), "{note}");
+        assert!(note.contains("/retry"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn retry_asks_again_without_adding_a_message() {
+        let mut app = app_with("");
+        app.history.push(ChatMessage::user("design the loops"));
+        let before = app.history.len();
+
+        app.input.set("/retry");
+        app.submit();
+
+        assert_eq!(app.history.len(), before, "retry adds no new message");
+        assert!(app.waiting.is_some(), "it should have asked again");
+    }
+
+    #[tokio::test]
+    async fn retry_with_nothing_to_retry_says_so() {
+        let mut app = app_with("");
+        app.input.set("/retry");
+        app.submit();
+        assert!(app.waiting.is_none());
+        assert!(app.status.contains("nothing to retry"), "{}", app.status);
+    }
+
+    #[tokio::test]
     async fn plain_conversation_without_json_is_not_an_error() {
         let mut app = app_with("");
         app.validate("What is the target, and which loops should I design?");
@@ -1488,6 +1844,47 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.history.len(), 1);
         assert!(app.status.contains("waiting"), "{}", app.status);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_chat_reopens_where_it_left_off() {
+        use crate::history::{ChatRecord, StoredMessage, StoredRole};
+
+        let (binder, target) = chains();
+        let mut record = ChatRecord::new("stub", "localhost", 7, &binder, &target);
+        record.messages = vec![
+            StoredMessage {
+                role: StoredRole::User,
+                text: "design the loops".to_string(),
+            },
+            StoredMessage {
+                role: StoredRole::Assistant,
+                text: GOOD_PLAN.to_string(),
+            },
+        ];
+        let id = record.id.clone();
+
+        let app = app_with("").resumed(record);
+
+        // The conversation the model will see is the stored one.
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.history[0].text, "design the loops");
+        assert_eq!(app.history[1].role, ChatRole::Assistant);
+
+        // The screen shows it too, under both speakers.
+        assert!(app
+            .transcript
+            .iter()
+            .any(|(entry, text)| *entry == Entry::You && text == "design the loops"));
+        assert!(app
+            .transcript
+            .iter()
+            .any(|(entry, _)| *entry == Entry::Model));
+
+        // The plan is re-derived from the last reply rather than trusted from
+        // the file, so one definition of validity applies.
+        assert!(app.plan.is_some(), "the stored plan should re-validate");
+        assert_eq!(app.chat_id(), id, "it carries on the same record");
     }
 
     #[tokio::test]

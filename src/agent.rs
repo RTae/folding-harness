@@ -207,6 +207,48 @@ impl ChatMessage {
     }
 }
 
+/// Picks uniformly from the legal set.
+///
+/// The control a benchmark measures against. A policy that cannot beat this
+/// is not earning its complexity.
+#[derive(Debug, Clone)]
+pub struct RandomAgent {
+    rng: crate::RunRng,
+    name: String,
+}
+
+impl RandomAgent {
+    pub fn new(seed: u64) -> Self {
+        RandomAgent {
+            rng: crate::rng_from_seed(seed),
+            name: "random".to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl DesignAgent for RandomAgent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn choose(
+        &mut self,
+        legal: &[SkillId],
+        _state: &SearchState,
+    ) -> Result<Decision, AgentError> {
+        let skill = legal
+            .choose(&mut self.rng)
+            .copied()
+            .ok_or(AgentError::NoLegalSkills)?;
+        Ok(Decision {
+            skill,
+            rationale: "uniform draw".to_string(),
+            decided_by: self.name.clone(),
+        })
+    }
+}
+
 /// A text model. Implement this over whichever API you use; the harness never
 /// assumes a vendor, a transport, or a tool-calling format.
 #[async_trait]
