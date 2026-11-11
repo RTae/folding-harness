@@ -443,22 +443,71 @@ fn parse_slash(line: &str) -> Option<Slash> {
     })
 }
 
-const HELP: &str = "/help           this list
-/provider       choose where prompts go, from your saved profiles
-/model <name>   use a different model, and remember it
-/url <url>      use a different endpoint, and remember it
-/retry          ask again, for a reply that was cut off
-/plan           show the current plan summary again
-/run            run the validated plan (same as Ctrl-R)
-/save [path]    write the plan to task.yaml, or to [path]
-/model          which model and endpoint this session is using
-/clear          forget the conversation so far and start over
-/quit           leave without running (same as Esc)
+/// The commands, their argument hint, and what they do.
+///
+/// One table drives the suggestion list and the help text, so the two cannot
+/// drift apart.
+const COMMANDS: &[(&str, &str, &str)] = &[
+    ("/help", "", "this list"),
+    (
+        "/provider",
+        "",
+        "choose where prompts go, from your saved profiles",
+    ),
+    (
+        "/model",
+        " <name>",
+        "use a different model, and remember it",
+    ),
+    (
+        "/url",
+        " <url>",
+        "use a different endpoint, and remember it",
+    ),
+    ("/retry", "", "ask again, for a reply that was cut off"),
+    ("/plan", "", "show the current plan summary again"),
+    ("/run", "", "run the validated plan (same as Ctrl-R)"),
+    (
+        "/save",
+        " [path]",
+        "write the plan to task.yaml, or to [path]",
+    ),
+    (
+        "/clear",
+        "",
+        "forget the conversation so far and start over",
+    ),
+    ("/quit", "", "leave without running (same as Esc)"),
+];
 
-Enter sends, Alt-Enter adds a line. Pasting several lines keeps them as one
+const KEY_HELP: &str = "Enter sends, Alt-Enter adds a line. Pasting several lines keeps them as one
 message. Left/Right and Home/End move within a line, Ctrl-W deletes a word,
 Ctrl-U clears the message, Up/Down move between lines or recall what you typed
-before. PgUp/PgDn scroll the transcript.";
+before. Tab completes a command. PgUp/PgDn scroll the transcript.";
+
+fn help_text() -> String {
+    let mut out = String::new();
+    for (name, argument, what) in COMMANDS {
+        out.push_str(&format!("{:<16}{what}\n", format!("{name}{argument}")));
+    }
+    out.push('\n');
+    out.push_str(KEY_HELP);
+    out
+}
+
+/// Commands matching what has been typed, while the message is still a bare
+/// `/word`. An argument having been started means the command is chosen.
+fn suggestions(input: &str) -> Vec<&'static (&'static str, &'static str, &'static str)> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('/') || trimmed.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    COMMANDS
+        .iter()
+        .filter(|(name, _, _)| name.starts_with(&lowered))
+        .collect()
+}
 
 pub struct ChatApp {
     provider: Arc<dyn ModelProvider>,
@@ -500,6 +549,10 @@ pub struct ChatApp {
     rebuild: Option<ProviderFactory>,
     /// Open when choosing a provider profile.
     picker: Option<Picker>,
+    /// Which suggestion is highlighted while typing a command.
+    suggestion: usize,
+    /// Set by Esc, so the list can be dismissed without it springing back.
+    suggestions_hidden: bool,
 }
 
 /// The provider chooser: a list of profile names and where the cursor is.
@@ -591,6 +644,8 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
             config_path: settings::config_path(),
             rebuild: None,
             picker: None,
+            suggestion: 0,
+            suggestions_hidden: false,
             provider,
             runtime,
             binder,
@@ -621,6 +676,37 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
 
     pub fn chat_id(&self) -> &str {
         &self.record.id
+    }
+
+    /// Commands matching what is typed, unless the list was dismissed.
+    fn visible_suggestions(&self) -> Vec<&'static (&'static str, &'static str, &'static str)> {
+        if self.suggestions_hidden {
+            return Vec::new();
+        }
+        suggestions(&self.input.text())
+    }
+
+    /// Tab: finish the highlighted command and leave the cursor ready for an
+    /// argument.
+    fn complete(&mut self) {
+        let matches = self.visible_suggestions();
+        let Some((name, argument, _)) =
+            matches.get(self.suggestion.min(matches.len().saturating_sub(1)))
+        else {
+            return;
+        };
+        // A command that takes an argument gets a trailing space, so typing
+        // can continue straight away.
+        let completed = if argument.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name} ")
+        };
+        self.input.set(&completed);
+        self.suggestion = 0;
+        // Completing is a decision, so the list gets out of the way. A command
+        // taking an argument ends with a space, which closes it anyway.
+        self.suggestions_hidden = true;
     }
 
     /// Let the screen change where prompts go.
@@ -790,7 +876,7 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
 
     fn run_slash(&mut self, command: Slash) {
         match command {
-            Slash::Help => self.note(HELP),
+            Slash::Help => self.note(help_text()),
             Slash::Quit => self.quit = true,
             Slash::Model => {
                 let text = format!(
@@ -1094,7 +1180,11 @@ task.yaml, or keep talking to change it."
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => self.quit = true,
-                KeyCode::Char('u') => self.input.clear(),
+                KeyCode::Char('u') => {
+                    self.input.clear();
+                    self.suggestion = 0;
+                    self.suggestions_hidden = false;
+                }
                 KeyCode::Char('w') => self.input.delete_word(),
                 KeyCode::Char('a') => self.input.home(),
                 KeyCode::Char('e') => self.input.end(),
@@ -1113,13 +1203,43 @@ task.yaml, or keep talking to change it."
             return;
         }
 
+        // While the command list is open it takes the keys it needs, so Up and
+        // Down choose a command rather than walking the history, and Esc
+        // dismisses the list rather than ending the session.
+        if !self.visible_suggestions().is_empty() {
+            match key.code {
+                KeyCode::Tab => {
+                    self.complete();
+                    return;
+                }
+                KeyCode::Up => {
+                    let count = self.visible_suggestions().len();
+                    self.suggestion = (self.suggestion + count - 1) % count;
+                    return;
+                }
+                KeyCode::Down => {
+                    let count = self.visible_suggestions().len();
+                    self.suggestion = (self.suggestion + 1) % count;
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.suggestions_hidden = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Esc => self.quit = true,
             // `?` is a character you might want to type, so the shortcut is
             // F1; /help does the same thing.
-            KeyCode::F(1) => self.note(HELP),
+            KeyCode::F(1) => self.note(help_text()),
             KeyCode::Enter => self.submit(),
-            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Backspace => {
+                self.input.backspace();
+                self.suggestion = 0;
+            }
             KeyCode::Delete => self.input.delete(),
             KeyCode::Left => self.input.left(),
             KeyCode::Right => self.input.right(),
@@ -1132,7 +1252,11 @@ task.yaml, or keep talking to change it."
                 self.scroll = self.scroll.saturating_sub(8);
             }
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(8),
-            KeyCode::Char(character) => self.input.insert(character),
+            KeyCode::Char(character) => {
+                self.input.insert(character);
+                self.suggestion = 0;
+                self.suggestions_hidden = false;
+            }
             _ => {}
         }
     }
@@ -1148,14 +1272,16 @@ task.yaml, or keep talking to change it."
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(6),
+                Constraint::Length(self.suggestion_height()),
                 Constraint::Length(self.input_height()),
                 Constraint::Length(1),
             ])
             .split(columns[0]);
 
         self.draw_transcript(frame, rows[0]);
-        self.draw_input(frame, rows[1]);
-        self.draw_footer(frame, rows[2]);
+        self.draw_suggestions(frame, rows[1]);
+        self.draw_input(frame, rows[2]);
+        self.draw_footer(frame, rows[3]);
         self.draw_plan(frame, columns[1]);
 
         if self.picker.is_some() {
@@ -1316,6 +1442,67 @@ task.yaml, or keep talking to change it."
 
         frame.render_widget(
             List::new(visible).block(Block::default().borders(Borders::ALL).title(title)),
+            area,
+        );
+    }
+
+    /// How tall the command list is, borders included, or zero when closed.
+    fn suggestion_height(&self) -> u16 {
+        let count = self.visible_suggestions().len();
+        if count == 0 {
+            0
+        } else {
+            2 + count.min(6) as u16
+        }
+    }
+
+    fn draw_suggestions(&self, frame: &mut Frame, area: Rect) {
+        let matches = self.visible_suggestions();
+        if matches.is_empty() || area.height < 3 {
+            return;
+        }
+        let rows = area.height.saturating_sub(2) as usize;
+        let selected = self.suggestion.min(matches.len() - 1);
+        // Keep the highlighted entry on screen when the list is long.
+        let first = if selected >= rows {
+            selected + 1 - rows
+        } else {
+            0
+        };
+
+        let lines: Vec<Line> = matches
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(rows)
+            .map(|(index, (name, argument, what))| {
+                let here = index == selected;
+                let mut label = Style::default().fg(Color::Cyan);
+                if here {
+                    label = label.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+                }
+                Line::from(vec![
+                    Span::styled(format!(" {} ", if here { '>' } else { ' ' }), label),
+                    Span::styled(
+                        format!("{:<16}", format!("{name}{argument}")),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled((*what).to_string(), Style::default().fg(Color::Gray)),
+                ])
+            })
+            .collect();
+
+        let title = if matches.len() == 1 {
+            " command — Tab to complete ".to_string()
+        } else {
+            format!(
+                " commands ({}) — Up/Down choose, Tab complete, Esc hide ",
+                matches.len()
+            )
+        };
+
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
             area,
         );
     }
@@ -1913,6 +2100,104 @@ mod tests {
         assert_eq!(parse_slash("use a 50/50 split"), None);
     }
 
+    #[test]
+    fn typing_a_slash_offers_every_command_and_narrows_as_you_type() {
+        assert_eq!(suggestions("/").len(), COMMANDS.len());
+        let narrowed = suggestions("/r");
+        let names: Vec<&str> = narrowed.iter().map(|(name, _, _)| *name).collect();
+        assert_eq!(names, vec!["/retry", "/run"]);
+
+        assert_eq!(
+            suggestions("/PRO")
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>(),
+            vec!["/provider"],
+            "matching ignores case"
+        );
+        assert!(suggestions("/nope").is_empty());
+    }
+
+    #[test]
+    fn the_list_closes_once_a_command_is_chosen_or_the_text_is_not_one() {
+        // An argument having been started means the command is settled.
+        assert!(suggestions("/save out.yaml").is_empty());
+        assert!(suggestions("/model ").is_empty());
+        // Ordinary messages never open it, including one that mentions a slash.
+        assert!(suggestions("design the loops").is_empty());
+        assert!(suggestions("use a 50/50 split").is_empty());
+        assert!(suggestions("").is_empty());
+    }
+
+    #[test]
+    fn the_help_text_is_generated_from_the_same_table() {
+        let help = help_text();
+        for (name, _, what) in COMMANDS {
+            assert!(help.contains(name), "{name} missing from the help");
+            assert!(help.contains(what), "{what:?} missing from the help");
+        }
+        assert!(help.contains("Tab completes a command"));
+    }
+
+    #[tokio::test]
+    async fn tab_completes_the_highlighted_command() {
+        let mut app = app_with("");
+        for character in "/ru".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(app.visible_suggestions().len(), 1, "only /run matches");
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.text(), "/run");
+        assert!(app.visible_suggestions().is_empty(), "the list closes");
+    }
+
+    #[tokio::test]
+    async fn completing_a_command_that_takes_an_argument_leaves_a_space() {
+        let mut app = app_with("");
+        app.input.set("/sa");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.text(), "/save ", "ready for the path");
+    }
+
+    #[tokio::test]
+    async fn up_and_down_choose_a_command_while_the_list_is_open() {
+        let mut app = app_with("");
+        app.input.set("/");
+        app.suggestion = 0;
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.suggestion, 1);
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.suggestion, 0);
+        // And it wraps rather than sticking at the ends.
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.suggestion, COMMANDS.len() - 1);
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.text(), COMMANDS[COMMANDS.len() - 1].0);
+    }
+
+    #[tokio::test]
+    async fn escape_hides_the_list_rather_than_ending_the_session() {
+        let mut app = app_with("");
+        app.input.set("/");
+        assert!(!app.visible_suggestions().is_empty());
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.quit, "Esc must not quit while the list is open");
+        assert!(app.visible_suggestions().is_empty(), "the list is hidden");
+
+        // Typing brings it back.
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(!app.visible_suggestions().is_empty());
+
+        // And once hidden with nothing open, Esc quits as usual.
+        app.input.clear();
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.quit);
+    }
+
     #[tokio::test]
     async fn a_slash_command_does_not_reach_the_model() {
         let mut app = app_with("");
@@ -1962,10 +2247,6 @@ mod tests {
                 )) as Arc<dyn ModelProvider>)
             }));
 
-        // Point the saved settings somewhere harmless for the duration.
-        let path = std::env::temp_dir().join(format!("fh-chatcfg-{}.json", crate::trace::now_ms()));
-        std::env::set_var("FH_CONFIG", &path);
-
         app.input.set("/model claude-opus-4-7");
         app.submit();
 
@@ -1983,12 +2264,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_provider_that_will_not_build_leaves_the_session_alone() {
-        let before = {
-            let app = app_with("");
-            app.provider.model().to_string()
-        };
-        let mut app =
-            app_with("").with_provider_factory(Box::new(|_| Err("no such model".to_string())));
+        let before = app_with("").provider.model().to_string();
+        // Its own config file: reading the one in $HOME would make this test
+        // depend on whatever the machine happens to have saved.
+        let path = std::env::temp_dir().join(format!("fh-nobuild-{}.json", crate::trace::now_ms()));
+        let mut app = app_with("")
+            .with_config_path(&path)
+            .with_provider_factory(Box::new(|_| Err("no such model".to_string())));
 
         app.input.set("/model nonsense");
         app.submit();
@@ -2001,6 +2283,9 @@ mod tests {
         assert!(app.settings.model.is_none(), "and must not be remembered");
         let note = &app.transcript.last().expect("a note").1;
         assert!(note.contains("no such model"), "{note}");
+        assert!(!path.exists(), "a failed switch must not write a config");
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]

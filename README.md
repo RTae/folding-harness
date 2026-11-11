@@ -114,9 +114,10 @@ several lines stays one message, because the screen turns on bracketed paste
 and reads a paste as one event rather than as a burst of Enter presses. Left
 and Right and Home and End move within a line, Ctrl-W deletes a word, Ctrl-U
 clears the message, and Up and Down move between lines or recall earlier
-messages. The slash commands `/help`, `/provider`, `/model`, `/url`, `/retry`, `/plan`,
-`/run`, `/save [path]`, `/clear` and `/quit` run locally and never reach the
-model. `/retry` asks again without adding a message, for a reply that was cut
+messages. Typing `/` opens the command list, which narrows as you type. Up and Down
+choose, Tab completes, Esc hides it. The commands `/help`, `/provider`,
+`/model`, `/url`, `/retry`, `/plan`, `/run`, `/save [path]`, `/clear` and
+`/quit` run locally and never reach the model. `/retry` asks again without adding a message, for a reply that was cut
 off mid-JSON. `/model <name>` and `/url <url>` switch where prompts go and
 remember the choice for later commands. `F1` prints the same list as `/help`.
 
