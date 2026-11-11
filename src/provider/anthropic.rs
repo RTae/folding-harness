@@ -26,6 +26,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::agent::{AgentError, ChatMessage, ModelProvider};
+use crate::settings::ProviderSettings;
 
 /// Pinned rather than tracking "latest": a silent API version change must not
 /// alter how a recorded run behaves. Override it for an endpoint that wants an
@@ -66,6 +67,51 @@ pub struct Provider {
 pub type AnthropicProvider = Provider;
 
 impl Provider {
+    /// Build from a profile and an already-resolved credential.
+    ///
+    /// The credential is passed in rather than read here, so one place decides
+    /// where credentials come from for every wire.
+    pub fn build(
+        settings: &ProviderSettings,
+        credential: super::Credential,
+    ) -> Result<Self, AgentError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(180))
+            .build()
+            .map_err(|error| AgentError::Provider(error.to_string()))?;
+
+        let mut provider = Provider {
+            client,
+            auth: match credential {
+                super::Credential::ApiKey(key) => Auth::ApiKey(key),
+                super::Credential::Bearer(token) => Auth::Bearer(token),
+            },
+            model: DEFAULT_MODEL.to_string(),
+            api_version: API_VERSION.to_string(),
+            effort: Some("high".to_string()),
+            fallbacks: true,
+            max_tokens: 16000,
+            base_url: DEFAULT_BASE_URL.to_string(),
+        };
+
+        if let Some(url) = &settings.url {
+            provider = provider.with_base_url(url.clone());
+        }
+        if let Some(model) = &settings.model {
+            provider = provider.with_model(model.clone());
+        }
+        if let Some(version) = &settings.api_version {
+            provider = provider.with_api_version(version.clone());
+        }
+        if let Some(effort) = &settings.effort {
+            provider = provider.with_effort(Some(effort.clone()));
+        }
+        if let Some(max_tokens) = settings.max_tokens {
+            provider = provider.with_max_tokens(max_tokens);
+        }
+        Ok(provider)
+    }
+
     /// Read configuration from the environment.
     ///
     /// Credentials: `ANTHROPIC_API_KEY`, else `ANTHROPIC_AUTH_TOKEN` (an OAuth
@@ -265,42 +311,6 @@ impl Provider {
         }
         betas
     }
-
-    /// Like [`Self::probe`], but over the streaming path, and reporting how
-    /// many pieces arrived. A gateway can serve ordinary requests and not
-    /// support server-sent events, which only a streamed request reveals.
-    pub async fn probe_stream(&self) -> Result<(String, usize), AgentError> {
-        let probe = Provider {
-            max_tokens: 64,
-            effort: self.effort.as_ref().map(|_| "low".to_string()),
-            ..self.clone()
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let text = probe
-            .converse_stream(
-                "Reply with the single word OK.",
-                &[ChatMessage::user("Reply with the single word OK.")],
-                tx,
-            )
-            .await?;
-        Ok((text, rx.into_iter().count()))
-    }
-
-    /// Send a tiny request to confirm the endpoint, credentials and model all
-    /// work together. Used by `fh doctor --probe-model`.
-    pub async fn probe(&self) -> Result<String, AgentError> {
-        let probe = Provider {
-            max_tokens: 64,
-            effort: self.effort.as_ref().map(|_| "low".to_string()),
-            ..self.clone()
-        };
-        probe
-            .converse(
-                "Reply with the single word OK.",
-                &[ChatMessage::user("Reply with the single word OK.")],
-            )
-            .await
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +394,14 @@ impl ModelProvider for Provider {
 
     fn endpoint(&self) -> &str {
         self.host()
+    }
+
+    fn is_first_party(&self) -> bool {
+        Provider::is_first_party(self)
+    }
+
+    fn describe(&self) -> String {
+        Provider::describe(self)
     }
 
     async fn complete(&self, system: &str, user: &str) -> Result<String, AgentError> {
