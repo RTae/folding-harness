@@ -158,6 +158,25 @@ impl ConfidenceBand {
     }
 }
 
+/// Canvas bounds that keep the projection undistorted.
+///
+/// A braille cell is 2 dots wide and 4 tall, so a pane has roughly twice as
+/// many addressable dots across as down for the same number of cells. Mapping
+/// the same world range to both axes would stretch the structure sideways, so
+/// the x range is widened in proportion to the dot aspect — equal world
+/// distances then cover equal screen distances, and a sphere looks round.
+pub fn canvas_bounds(width: u16, height: u16, zoom: f64) -> ([f64; 2], [f64; 2]) {
+    let dots_x = f64::from(width.saturating_sub(2)) * 2.0;
+    let dots_y = f64::from(height.saturating_sub(2)) * 4.0;
+    let aspect = if dots_y > 0.0 {
+        (dots_x / dots_y).clamp(0.2, 8.0)
+    } else {
+        1.0
+    };
+    let bound = zoom.max(1.0) * 1.05;
+    ([-bound * aspect, bound * aspect], [-bound, bound])
+}
+
 /// Consecutive residues of the same chain, as segments to draw.
 pub fn backbone_segments(points: &[Projected]) -> Vec<(Projected, Projected)> {
     points
@@ -257,6 +276,40 @@ mod tests {
         assert_eq!(ConfidenceBand::of(70.0), ConfidenceBand::Confident);
         assert_eq!(ConfidenceBand::of(69.0), ConfidenceBand::Low);
         assert_eq!(ConfidenceBand::of(49.0), ConfidenceBand::VeryLow);
+    }
+
+    #[test]
+    fn canvas_bounds_correct_for_the_braille_dot_aspect() {
+        // Braille dots are square, so equal world distance must cover equal
+        // dot counts: x_span / y_span == dots_x / dots_y.
+        let ratio = |width: u16, height: u16| {
+            let (x, y) = canvas_bounds(width, height, 1.0);
+            (x[1] - x[0]) / (y[1] - y[0])
+        };
+        let expected =
+            |width: u16, height: u16| (f64::from(width - 2) * 2.0) / (f64::from(height - 2) * 4.0);
+
+        // A pane that is square in *cells* is tall in dots, so x covers less.
+        assert!((ratio(42, 42) - expected(42, 42)).abs() < 1e-9);
+        assert!(ratio(42, 42) < 1.0, "a square cell pane is tall in dots");
+
+        // The usual case: a wide, short pane, where x covers more.
+        assert!((ratio(84, 24) - expected(84, 24)).abs() < 1e-9);
+        assert!(ratio(84, 24) > 1.0, "a wide pane is wide in dots too");
+
+        let (x, y) = canvas_bounds(42, 42, 1.0);
+        let x_span = x[1] - x[0];
+        let y_span = y[1] - y[0];
+        assert!(x[0] < 0.0 && y[0] < 0.0, "bounds should straddle zero");
+
+        // Zoom scales both axes together, so the aspect is preserved.
+        let (zx, zy) = canvas_bounds(42, 42, 2.0);
+        assert!(((zx[1] - zx[0]) / (zy[1] - zy[0]) - x_span / y_span).abs() < 1e-9);
+        assert!(zy[1] > y[1]);
+
+        // Degenerate panes must not divide by zero or explode.
+        let (tiny_x, tiny_y) = canvas_bounds(0, 0, 1.0);
+        assert!(tiny_x[1].is_finite() && tiny_y[1].is_finite());
     }
 
     #[test]

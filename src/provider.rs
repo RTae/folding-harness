@@ -223,6 +223,38 @@ impl Provider {
         body
     }
 
+    /// Attach credentials and any beta headers.
+    fn authorized(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut builder = match &self.auth {
+            Auth::ApiKey(key) => builder.header("x-api-key", key),
+            Auth::Bearer(token) => builder.header("authorization", format!("Bearer {token}")),
+        };
+        let betas = self.beta_headers();
+        if !betas.is_empty() {
+            builder = builder.header("anthropic-beta", betas.join(","));
+        }
+        builder
+    }
+
+    /// The hints matter most on a custom endpoint, where a 404 is far more
+    /// likely to be a wrong URL than a wrong request.
+    fn status_error(&self, status: u16, body: &str) -> AgentError {
+        let hint = match status {
+            401 | 403 => " — check the API key for this endpoint",
+            404 => " — check the base URL, and that this endpoint serves this model",
+            400 if !self.is_first_party() => {
+                " — the endpoint rejected the request; try --api-version, or a model it serves"
+            }
+            429 => " — rate limited",
+            _ => "",
+        };
+        AgentError::Provider(format!(
+            "{} returned HTTP {status}{hint}: {}",
+            self.host(),
+            body.chars().take(400).collect::<String>()
+        ))
+    }
+
     fn beta_headers(&self) -> Vec<&str> {
         let mut betas = Vec::new();
         if self.fallbacks {
@@ -232,6 +264,26 @@ impl Provider {
             betas.push(OAUTH_BETA);
         }
         betas
+    }
+
+    /// Like [`Self::probe`], but over the streaming path, and reporting how
+    /// many pieces arrived. A gateway can serve ordinary requests and not
+    /// support server-sent events, which only a streamed request reveals.
+    pub async fn probe_stream(&self) -> Result<(String, usize), AgentError> {
+        let probe = Provider {
+            max_tokens: 64,
+            effort: self.effort.as_ref().map(|_| "low".to_string()),
+            ..self.clone()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let text = probe
+            .converse_stream(
+                "Reply with the single word OK.",
+                &[ChatMessage::user("Reply with the single word OK.")],
+                tx,
+            )
+            .await?;
+        Ok((text, rx.into_iter().count()))
     }
 
     /// Send a tiny request to confirm the endpoint, credentials and model all
@@ -334,28 +386,133 @@ impl ModelProvider for Provider {
         self.converse(system, &[ChatMessage::user(user)]).await
     }
 
+    /// Server-sent events, so a reply appears as it is written rather than
+    /// after a long silence.
+    async fn converse_stream(
+        &self,
+        system: &str,
+        messages: &[ChatMessage],
+        deltas: std::sync::mpsc::Sender<String>,
+    ) -> Result<String, AgentError> {
+        use futures_util::StreamExt;
+
+        if messages.is_empty() {
+            return Err(AgentError::Provider("no messages to send".to_string()));
+        }
+
+        let mut body = self.request_body(system, messages);
+        if let Some(map) = body.as_object_mut() {
+            map.insert("stream".into(), json!(true));
+        }
+
+        let response = self
+            .authorized(
+                self.client
+                    .post(format!("{}/v1/messages", self.base_url))
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", &self.api_version),
+            )
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                AgentError::Provider(format!("could not reach {}: {error}", self.host()))
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(self.status_error(status.as_u16(), &text));
+        }
+
+        let mut stream = response.bytes_stream();
+        // Bytes, not a String: a multi-byte character can straddle two chunks,
+        // and decoding a partial chunk would corrupt it.
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut text = String::new();
+        let mut stop_reason: Option<String> = None;
+        let mut refusal: Option<String> = None;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                AgentError::Provider(format!("stream from {} broke: {error}", self.host()))
+            })?;
+            buffer.extend_from_slice(&chunk);
+
+            while let Some(at) = buffer.windows(2).position(|pair| pair == b"\n\n") {
+                let event: Vec<u8> = buffer.drain(..at + 2).collect();
+                let event = String::from_utf8_lossy(&event);
+
+                for line in event.lines() {
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let data = data.trim();
+                    if data.is_empty() || data == "[DONE]" {
+                        continue;
+                    }
+                    let Ok(value) = serde_json::from_str::<Value>(data) else {
+                        continue;
+                    };
+
+                    match value.get("type").and_then(Value::as_str) {
+                        Some("content_block_delta") => {
+                            if value["delta"]["type"] == "text_delta" {
+                                if let Some(piece) = value["delta"]["text"].as_str() {
+                                    text.push_str(piece);
+                                    let _ = deltas.send(piece.to_string());
+                                }
+                            }
+                        }
+                        Some("message_delta") => {
+                            if let Some(reason) = value["delta"]["stop_reason"].as_str() {
+                                stop_reason = Some(reason.to_string());
+                            }
+                            if let Some(category) =
+                                value["delta"]["stop_details"]["category"].as_str()
+                            {
+                                refusal = Some(category.to_string());
+                            }
+                        }
+                        Some("error") => {
+                            let detail = value["error"]["message"]
+                                .as_str()
+                                .unwrap_or("the stream reported an error");
+                            return Err(AgentError::Provider(detail.to_string()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if stop_reason.as_deref() == Some("refusal") {
+            return Err(AgentError::Provider(format!(
+                "the model declined this request ({})",
+                refusal.unwrap_or_else(|| "no category given".to_string())
+            )));
+        }
+        if text.trim().is_empty() {
+            return Err(AgentError::Provider(format!(
+                "the stream produced no text (stop_reason {})",
+                stop_reason.as_deref().unwrap_or("unknown")
+            )));
+        }
+        Ok(text)
+    }
+
     async fn converse(&self, system: &str, messages: &[ChatMessage]) -> Result<String, AgentError> {
         if messages.is_empty() {
             return Err(AgentError::Provider("no messages to send".to_string()));
         }
 
-        let mut request = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("content-type", "application/json")
-            .header("anthropic-version", &self.api_version);
-
-        request = match &self.auth {
-            Auth::ApiKey(key) => request.header("x-api-key", key),
-            Auth::Bearer(token) => request.header("authorization", format!("Bearer {token}")),
-        };
-
-        let betas = self.beta_headers();
-        if !betas.is_empty() {
-            request = request.header("anthropic-beta", betas.join(","));
-        }
-
-        let response = request
+        let response = self
+            .authorized(
+                self.client
+                    .post(format!("{}/v1/messages", self.base_url))
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", &self.api_version),
+            )
             .json(&self.request_body(system, messages))
             .send()
             .await
@@ -370,23 +527,7 @@ impl ModelProvider for Provider {
             .map_err(|error| AgentError::Provider(error.to_string()))?;
 
         if !status.is_success() {
-            // The hints matter most on a custom endpoint, where a 404 is far
-            // more likely to be a wrong URL than a wrong request.
-            let hint = match status.as_u16() {
-                401 | 403 => " — check the API key for this endpoint",
-                404 => " — check the base URL, and that this endpoint serves this model",
-                400 if !self.is_first_party() => {
-                    " — the endpoint rejected the request; try --api-version, or a model it serves"
-                }
-                429 => " — rate limited",
-                _ => "",
-            };
-            return Err(AgentError::Provider(format!(
-                "{} returned HTTP {}{hint}: {}",
-                self.host(),
-                status.as_u16(),
-                text.chars().take(400).collect::<String>()
-            )));
+            return Err(self.status_error(status.as_u16(), &text));
         }
 
         text_from_response(&text)
@@ -525,6 +666,139 @@ mod tests {
         let mut custom = provider().with_base_url("https://gateway.example.com");
         custom.auth = Auth::Bearer("token".to_string());
         assert_eq!(custom.beta_headers(), vec![OAUTH_BETA]);
+    }
+
+    /// Serve a fixed SSE body, cut into deliberately awkward chunks, and
+    /// return the address.
+    ///
+    /// The point is the boundaries: a real stream splits events mid-JSON and
+    /// can split a multi-byte character across two chunks, and a parser that
+    /// decoded each chunk as text on its own would corrupt both.
+    async fn serve_sse(body: &'static str, chunk_size: usize) -> String {
+        use axum::routing::post;
+        use axum::Router;
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                let chunks: Vec<Result<Vec<u8>, std::io::Error>> = body
+                    .as_bytes()
+                    .chunks(chunk_size)
+                    .map(|chunk| Ok(chunk.to_vec()))
+                    .collect();
+                axum::body::Body::from_stream(futures_util::stream::iter(chunks))
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    const SSE: &str = "event: message_start\n\
+data: {\"type\":\"message_start\"}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\
+\n\
+event: ping\n\
+data: {\"type\":\"ping\"}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"世界 ok\"}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+
+    #[tokio::test]
+    async fn a_stream_split_across_awkward_chunks_reassembles_exactly() {
+        // 7 bytes at a time cuts through JSON and through the three-byte
+        // characters in "世界".
+        let base = serve_sse(SSE, 7).await;
+        let provider = provider().with_base_url(base);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let text = provider
+            .converse_stream("sys", &[ChatMessage::user("hi")], tx)
+            .await
+            .expect("the stream parses");
+
+        assert_eq!(text, "Hello 世界 ok");
+        let pieces: Vec<String> = rx.into_iter().collect();
+        assert_eq!(pieces, vec!["Hello ".to_string(), "世界 ok".to_string()]);
+        assert_eq!(pieces.concat(), text, "deltas must match the whole reply");
+    }
+
+    #[tokio::test]
+    async fn one_byte_at_a_time_still_reassembles() {
+        let base = serve_sse(SSE, 1).await;
+        let provider = provider().with_base_url(base);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let text = provider
+            .converse_stream("sys", &[ChatMessage::user("hi")], tx)
+            .await
+            .expect("the stream parses");
+        assert_eq!(text, "Hello 世界 ok");
+        assert_eq!(rx.into_iter().collect::<Vec<_>>().concat(), text);
+    }
+
+    const REFUSAL_SSE: &str = "event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"category\":\"bio\"}}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+
+    #[tokio::test]
+    async fn a_refusal_mid_stream_is_an_error_naming_its_category() {
+        let base = serve_sse(REFUSAL_SSE, 9).await;
+        let provider = provider().with_base_url(base);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let error = provider
+            .converse_stream("sys", &[ChatMessage::user("hi")], tx)
+            .await
+            .expect_err("a refusal must not read as an empty success");
+        let message = error.to_string();
+        assert!(message.contains("declined"), "{message}");
+        assert!(message.contains("bio"), "{message}");
+    }
+
+    const ERROR_SSE: &str = "event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream is busy\"}}\n\
+\n";
+
+    #[tokio::test]
+    async fn an_error_event_in_the_stream_is_reported() {
+        let base = serve_sse(ERROR_SSE, 5).await;
+        let provider = provider().with_base_url(base);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let error = provider
+            .converse_stream("sys", &[ChatMessage::user("hi")], tx)
+            .await
+            .expect_err("an error event must surface");
+        assert!(error.to_string().contains("upstream is busy"), "{error}");
+    }
+
+    const EMPTY_SSE: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    #[tokio::test]
+    async fn a_stream_with_no_text_is_an_error_not_an_empty_reply() {
+        let base = serve_sse(EMPTY_SSE, 4).await;
+        let provider = provider().with_base_url(base);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        assert!(provider
+            .converse_stream("sys", &[ChatMessage::user("hi")], tx)
+            .await
+            .is_err());
     }
 
     #[test]

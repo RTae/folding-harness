@@ -15,7 +15,7 @@ pub mod chat;
 pub mod structure;
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
 
 use ratatui::backend::CrosstermBackend;
@@ -75,6 +75,23 @@ impl Tab {
 
     fn index(&self) -> usize {
         Tab::ALL.iter().position(|tab| tab == self).unwrap_or(0)
+    }
+
+    /// Match a pane by name, case-insensitively, for `--pane`.
+    pub fn from_name(name: &str) -> Option<Tab> {
+        let wanted = name.trim().to_ascii_lowercase();
+        Tab::ALL
+            .iter()
+            .copied()
+            .find(|tab| tab.title().to_ascii_lowercase() == wanted)
+    }
+
+    pub fn names() -> String {
+        Tab::ALL
+            .iter()
+            .map(|tab| tab.title().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn next(&self) -> Tab {
@@ -1029,7 +1046,8 @@ impl App {
             .map(|point| (point.x, point.y))
             .collect();
 
-        let bound = camera.zoom.max(1.0) * 1.05;
+        let (x_bounds, y_bounds) =
+            structure::canvas_bounds(columns[0].width, columns[0].height, camera.zoom);
 
         let canvas = Canvas::default()
             .block(
@@ -1038,8 +1056,8 @@ impl App {
                     .title(format!(" {} backbone ", candidate.id)),
             )
             .marker(Marker::Braille)
-            .x_bounds([-bound, bound])
-            .y_bounds([-bound, bound])
+            .x_bounds(x_bounds)
+            .y_bounds(y_bounds)
             .paint(move |ctx| {
                 for (from, to) in &segments {
                     let color = if from.designed {
@@ -1213,10 +1231,62 @@ impl App {
     }
 }
 
+/// Render one pane once, as plain text, without taking over the terminal.
+///
+/// For looking at a finished run over a pipe, pasting a backbone into a note,
+/// or checking a pane in CI. Colour carries the confidence bands in the live
+/// dashboard and is dropped here; the braille still carries the shape.
+pub fn snapshot(
+    paths: TaskPaths,
+    tab: Tab,
+    width: u16,
+    height: u16,
+    camera: Option<Camera>,
+) -> io::Result<String> {
+    use ratatui::backend::TestBackend;
+
+    let mut app = App::new(paths);
+    app.refresh();
+    app.tab = tab;
+    if let Some(camera) = camera {
+        app.camera = camera;
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(width.max(40), height.max(12)))?;
+    terminal.draw(|frame| app.draw(frame))?;
+
+    let buffer = terminal.backend().buffer();
+    let area = buffer.area;
+    let cells = buffer.content();
+
+    let mut out = String::new();
+    for y in 0..area.height {
+        let mut line = String::new();
+        for x in 0..area.width {
+            let index = y as usize * area.width as usize + x as usize;
+            if let Some(cell) = cells.get(index) {
+                line.push_str(cell.symbol());
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// Run the dashboard until the user quits.
 pub fn run(paths: TaskPaths, tick: Duration) -> io::Result<()> {
     let mut app = App::new(paths);
     app.refresh();
+
+    // Entering raw mode on a non-terminal fails with "Device not configured",
+    // which says nothing useful. Check first.
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(io::Error::other(
+            "this needs an interactive terminal: run it directly, not through a pipe \
+             and not with stdin or stdout redirected",
+        ));
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

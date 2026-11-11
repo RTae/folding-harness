@@ -42,7 +42,10 @@ fn nearby(value: &str) -> Vec<std::path::PathBuf> {
         std::path::PathBuf::from(name),
     ];
     // Beside the file they asked for, if they gave a directory.
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         candidates.push(parent.join("examples").join(name));
     }
 
@@ -226,5 +229,37 @@ mod tests {
         assert_eq!(records[0].sequence, "QVQLVESG");
 
         assert!(load_or_literal("./no/such/file.fasta", "H").is_err());
+    }
+
+    #[test]
+    fn a_missing_file_points_at_the_one_that_does_exist() {
+        // Run from the repository root, where `examples/binder.fasta` exists
+        // but a bare `binder.fasta` does not — the exact mistake this hint is
+        // for. Skip when the layout is not there, so the test does not depend
+        // on the working directory.
+        if !std::path::Path::new("examples/binder.fasta").is_file()
+            || std::path::Path::new("binder.fasta").is_file()
+        {
+            return;
+        }
+
+        let error = load_or_literal("binder.fasta", "H").expect_err("not in this directory");
+        let message = error.to_string();
+        assert!(
+            message.contains("examples/binder.fasta"),
+            "the error should name the file that does exist: {message}"
+        );
+        assert!(message.contains("fh init"), "{message}");
+    }
+
+    #[test]
+    fn a_name_that_exists_nowhere_gets_no_misleading_hint() {
+        let error = load_or_literal("definitely-not-here-9f3a.fasta", "H")
+            .expect_err("no such file anywhere");
+        let message = error.to_string();
+        assert!(
+            !message.contains("There is a file of that name"),
+            "{message}"
+        );
     }
 }

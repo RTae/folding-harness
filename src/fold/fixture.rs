@@ -229,33 +229,74 @@ impl FixtureBackend {
         }
     }
 
-    /// A synthetic backbone: alternating helical and extended segments, one
-    /// cluster per chain. Enough for the viewer to show a recognisable shape
-    /// that changes as the sequence changes.
+    /// A synthetic backbone, shaped like a compact chain rather than a line.
+    ///
+    /// A confined random walk: each step is 3.8 Å, the real alpha-carbon
+    /// spacing, with a restoring pull toward the chain's centre once the walk
+    /// strays past a radius that grows with chain length the way a radius of
+    /// gyration does. The result is a globular tangle the viewer can rotate,
+    /// with the two chains placed side by side so there is an interface to
+    /// look at.
+    ///
+    /// This is geometry, not prediction. Nothing here is folded, and the shape
+    /// says nothing about the sequence beyond being deterministic in it.
     fn ca_trace(job: &JobSpec, plddt: &[f32], state: &mut u64) -> Vec<CaResidue> {
+        /// Real Cα–Cα spacing, so the overall dimensions are plausible.
+        const STEP: f32 = 3.8;
+
         let mut out = Vec::new();
         let mut designed_seen = 0usize;
 
         for (chain_index, chain) in job.chains.iter().enumerate() {
-            let offset = [chain_index as f32 * 26.0 - 13.0, 0.0, 0.0];
-            let wobble = (unit(state) as f32 - 0.5) * 2.0;
+            let count = chain.sequence.chars().count().max(1);
+            let radius = 2.4 * (count as f32).powf(0.38);
+            // Chain 0 to the left of the origin, the rest to the right, so the
+            // two sit adjacent instead of overlapping.
+            let centre = [
+                if chain_index == 0 {
+                    -radius - 2.0
+                } else {
+                    radius + 2.0
+                },
+                0.0,
+                0.0,
+            ];
+
+            let mut position = centre;
+            let mut direction = [1.0f32, 0.0, 0.0];
 
             for (index, residue) in chain.sequence.chars().enumerate() {
-                let i = index as f32;
-                // Segment style flips every 11 residues.
-                let helical = (index / 11) % 2 == 0;
-                let (radius, rise, turn) = if helical {
-                    (3.8, 1.5, 1.75)
-                } else {
-                    (1.2, 3.1, 0.35)
-                };
-                let angle = i * turn + wobble;
-                let drift = (i * 0.07).sin() * 2.2;
+                let mut jitter = |span: f32| (unit(state) as f32 - 0.5) * span;
+                let mut next = [
+                    direction[0] + jitter(1.6),
+                    direction[1] + jitter(1.6),
+                    direction[2] + jitter(1.6),
+                ];
 
-                let xyz = [
-                    offset[0] + radius * angle.cos() + drift,
-                    offset[1] + radius * angle.sin(),
-                    offset[2] + i * rise * 0.45 - chain.sequence.len() as f32 * 0.22,
+                // Pull back toward the centre once the walk wanders out, which
+                // is what keeps it compact instead of escaping.
+                let offset = [
+                    position[0] - centre[0],
+                    position[1] - centre[1],
+                    position[2] - centre[2],
+                ];
+                let distance =
+                    (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
+                if distance > radius * 0.55 && distance > f32::EPSILON {
+                    let pull = (distance / radius) * 1.4;
+                    next[0] -= offset[0] / distance * pull;
+                    next[1] -= offset[1] / distance * pull;
+                    next[2] -= offset[2] / distance * pull;
+                }
+
+                let length = (next[0] * next[0] + next[1] * next[1] + next[2] * next[2]).sqrt();
+                if length > f32::EPSILON {
+                    direction = [next[0] / length, next[1] / length, next[2] / length];
+                }
+                position = [
+                    position[0] + direction[0] * STEP,
+                    position[1] + direction[1] * STEP,
+                    position[2] + direction[2] * STEP,
                 ];
 
                 let confidence = if chain.designed {
@@ -270,7 +311,7 @@ impl FixtureBackend {
                     chain_index: chain_index as u8,
                     index: index as u32,
                     residue,
-                    xyz,
+                    xyz: position,
                     plddt: confidence,
                     designed: chain.designed,
                 });

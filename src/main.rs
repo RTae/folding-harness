@@ -148,6 +148,21 @@ enum Command {
         task: Option<String>,
         #[arg(long, default_value_t = 400)]
         tick_ms: u64,
+        /// Render one frame as plain text and exit, instead of opening the
+        /// dashboard. Works over a pipe and needs no terminal.
+        #[arg(long)]
+        snapshot: bool,
+        /// Which pane to snapshot: overview, population, lineage, structure
+        /// or events.
+        #[arg(long, default_value = "overview")]
+        pane: String,
+        #[arg(long, default_value_t = 120)]
+        width: u16,
+        #[arg(long, default_value_t = 40)]
+        height: u16,
+        /// Rotate the structure view before rendering: yaw,pitch in radians.
+        #[arg(long)]
+        view: Option<String>,
     },
     /// Serve a stub compute service speaking the fold contract.
     Serve {
@@ -167,6 +182,10 @@ enum Command {
         /// key and model work together. This costs a few tokens.
         #[arg(long)]
         probe_model: bool,
+        /// Probe over the streaming path as well, which is what `fh chat`
+        /// uses. An endpoint can serve ordinary requests and not stream.
+        #[arg(long)]
+        probe_stream: bool,
         #[command(flatten)]
         provider: ProviderOptions,
     },
@@ -240,7 +259,21 @@ async fn main() -> Result<()> {
             path,
             task,
             tick_ms,
-        } => board(path, task, Duration::from_millis(tick_ms)),
+            snapshot,
+            pane,
+            width,
+            height,
+            view,
+        } => board(
+            path,
+            task,
+            Duration::from_millis(tick_ms),
+            snapshot,
+            pane,
+            width,
+            height,
+            view,
+        ),
         Command::Serve {
             port,
             task,
@@ -249,8 +282,9 @@ async fn main() -> Result<()> {
         Command::Doctor {
             task,
             probe_model,
+            probe_stream,
             provider,
-        } => doctor(task, probe_model, provider).await,
+        } => doctor(task, probe_model, probe_stream, provider).await,
         Command::Skills => {
             skills();
             Ok(())
@@ -716,12 +750,56 @@ fn resolve_task_dir(path: Option<PathBuf>, task: Option<String>) -> Result<TaskP
     })
 }
 
-fn board(path: Option<PathBuf>, task: Option<String>, tick: Duration) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn board(
+    path: Option<PathBuf>,
+    task: Option<String>,
+    tick: Duration,
+    snapshot: bool,
+    pane: String,
+    width: u16,
+    height: u16,
+    view: Option<String>,
+) -> Result<()> {
     let paths = resolve_task_dir(path, task)?;
     if !paths.root().exists() {
         return Err(anyhow!("{} does not exist", paths.root().display()));
     }
-    fh::tui::run(paths, tick).context("running the dashboard")
+
+    if !snapshot {
+        return fh::tui::run(paths, tick).context("running the dashboard");
+    }
+
+    let tab = fh::tui::Tab::from_name(&pane).ok_or_else(|| {
+        anyhow!(
+            "no pane called '{pane}'; choose one of: {}",
+            fh::tui::Tab::names()
+        )
+    })?;
+
+    let camera =
+        match view.as_deref() {
+            None => None,
+            Some(text) => {
+                let mut parts = text.split(',').map(str::trim);
+                let yaw: f64 = parts.next().unwrap_or("").parse().map_err(|_| {
+                    anyhow!("--view wants yaw,pitch in radians, e.g. --view 0.9,0.3")
+                })?;
+                let pitch: f64 = parts.next().unwrap_or("0").parse().map_err(|_| {
+                    anyhow!("--view wants yaw,pitch in radians, e.g. --view 0.9,0.3")
+                })?;
+                Some(fh::tui::structure::Camera {
+                    yaw,
+                    pitch,
+                    zoom: 1.0,
+                })
+            }
+        };
+
+    let text =
+        fh::tui::snapshot(paths, tab, width, height, camera).context("rendering the pane")?;
+    print!("{text}");
+    Ok(())
 }
 
 async fn serve(port: u16, task: Option<PathBuf>, latency: Duration) -> Result<()> {
@@ -758,7 +836,12 @@ async fn serve(port: u16, task: Option<PathBuf>, latency: Duration) -> Result<()
         .map_err(|error| anyhow!("serving: {error}"))
 }
 
-async fn doctor(task: Option<PathBuf>, probe_model: bool, options: ProviderOptions) -> Result<()> {
+async fn doctor(
+    task: Option<PathBuf>,
+    probe_model: bool,
+    probe_stream: bool,
+    options: ProviderOptions,
+) -> Result<()> {
     println!("fh          {}", env!("CARGO_PKG_VERSION"));
     println!("protocol    {}", fh::contract::PROTOCOL);
 
@@ -769,7 +852,7 @@ async fn doctor(task: Option<PathBuf>, probe_model: bool, options: ProviderOptio
         Err(error) => println!("            NOT writable: {error}"),
     }
 
-    if probe_model {
+    if probe_model || probe_stream {
         println!();
         match make_provider(&options) {
             Err(error) => {
@@ -783,14 +866,38 @@ async fn doctor(task: Option<PathBuf>, probe_model: bool, options: ProviderOptio
                 print!("            probing ... ");
                 use std::io::Write;
                 std::io::stdout().flush().ok();
-                match provider.probe().await {
-                    Ok(reply) => {
-                        println!("ok: {}", reply.trim().chars().take(60).collect::<String>())
+                if probe_model {
+                    match provider.probe().await {
+                        Ok(reply) => {
+                            println!("ok: {}", reply.trim().chars().take(60).collect::<String>())
+                        }
+                        Err(error) => {
+                            println!("FAILED");
+                            println!("            {error}");
+                            return Err(anyhow!("model probe failed"));
+                        }
                     }
-                    Err(error) => {
-                        println!("FAILED");
-                        println!("            {error}");
-                        return Err(anyhow!("model probe failed"));
+                } else {
+                    println!("skipped");
+                }
+
+                if probe_stream {
+                    print!("            streaming ... ");
+                    std::io::stdout().flush().ok();
+                    match provider.probe_stream().await {
+                        Ok((reply, pieces)) => println!(
+                            "ok: {pieces} piece(s), {}",
+                            reply.trim().chars().take(40).collect::<String>()
+                        ),
+                        Err(error) => {
+                            println!("FAILED");
+                            println!("            {error}");
+                            println!(
+                                "            `fh chat` streams, so it will not work against \
+                                 this endpoint; `fh task` does not stream and still will."
+                            );
+                            return Err(anyhow!("streaming probe failed"));
+                        }
                     }
                 }
             }

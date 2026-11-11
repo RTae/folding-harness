@@ -215,7 +215,27 @@ pub trait ModelProvider: Send + Sync {
 
     async fn complete(&self, system: &str, user: &str) -> Result<String, AgentError>;
 
-    /// Multi-turn conversation, for the chat interface.
+    /// Multi-turn conversation, streaming the reply as it is generated.
+    ///
+    /// Each piece of text is sent on `deltas` as it arrives, and the whole
+    /// reply is returned at the end. The default implementation calls
+    /// [`Self::converse`] and sends the reply in one piece, so a provider that
+    /// cannot stream still works — the interface just waits longer.
+    ///
+    /// A send failure on `deltas` is ignored: the receiver going away means
+    /// nobody is watching, which is not a reason to abandon the request.
+    async fn converse_stream(
+        &self,
+        system: &str,
+        messages: &[ChatMessage],
+        deltas: std::sync::mpsc::Sender<String>,
+    ) -> Result<String, AgentError> {
+        let text = self.converse(system, messages).await?;
+        let _ = deltas.send(text.clone());
+        Ok(text)
+    }
+
+    /// Multi-turn conversation.
     ///
     /// The default flattens the turns into one message, so a provider that can
     /// only do single completions still works. A provider with a real messages

@@ -130,8 +130,14 @@ fh chat --binder binder.fasta --target target.fasta
 ┌─ message ────────────────────────────────────┐│                              │
 │ ▮                                            ││ Ctrl-R to run                │
 └──────────────────────────────────────────────┘└──────────────────────────────┘
-Enter send   Ctrl-R run plan   Ctrl-S save   PgUp/PgDn scroll   Esc quit
+Enter send   Ctrl-R run   /help commands   PgUp/PgDn scroll   Esc quit
 ```
+
+Replies stream in as they are written. The message line is a real editor —
+Left/Right and Home/End move the cursor, Ctrl-W deletes a word, Ctrl-U clears
+the line, and Up/Down recall earlier messages. Slash commands (`/help`,
+`/plan`, `/run`, `/save [path]`, `/model`, `/clear`, `/quit`) are handled
+locally and never reach the model.
 
 The pane on the right is **not the model's description of the plan** — it is what
 the typed config actually resolves to after the same validation a hand-written
@@ -170,8 +176,12 @@ fh doctor --probe-model \
 
 `--probe-model` sends one tiny request and prints what came back, so a wrong
 URL, key or model name is a one-line answer rather than a failure in the middle
-of a plan. Probe each model you intend to use: a gateway can serve one model
-happily and fail on another. The same four flags work on `fh chat` and `fh task`, and
+of a plan. Add `--probe-stream` to check the streaming path too, which is what
+`fh chat` uses — an endpoint can serve ordinary requests and not support
+server-sent events, and then `fh chat` will not work while `fh task` still
+will. Probe each model you intend to use: a gateway can serve one model
+happily and fail on another, including by declining a request that another
+model accepts. The same four flags work on `fh chat` and `fh task`, and
 `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` and `ANTHROPIC_API_VERSION` set them
 from the environment.
 
@@ -267,8 +277,32 @@ same inputs. Set `FH_TASK_ROOT` to move the directory.
 counts, the last routing decision and why each skill was refused), **Population**
 (ranked table, loss broken down by term, the sequence with fixed residues grey,
 mutable green and changed yellow), **Lineage** (parent/child tree of retained
-candidates), **Structure** (the backbone drawn with braille glyphs, coloured by
-confidence band, rotatable with `h/l/u/d`, zoom `+/-`), and **Events** (the trace).
+candidates), **Structure** (below), and **Events** (the trace).
+
+### The structure pane
+
+The predicted backbone, drawn with braille glyphs — 2×4 addressable dots per
+cell, so a modest pane holds a few hundred points. Alpha carbons are joined
+into a backbone and coloured by confidence band (blue, cyan, yellow, red for
+very high through very low; the fixed target in grey). `h`/`l` turn it, `u`/`d`
+tilt it, `+`/`-` zoom, `0` resets.
+
+The projection is orthographic, and the canvas bounds are corrected for the
+braille dot aspect so the shape is not stretched sideways — a braille cell is
+2 dots wide and 4 tall, so equal world distances need unequal world *ranges*
+on the two axes.
+
+To see a pane without taking over the terminal — over a pipe, in a note, or in
+CI — render one frame as text:
+
+```bash
+fh board --snapshot --pane structure --width 100 --height 32
+fh board --snapshot --pane structure --view 0.8,1.2    # yaw,pitch in radians
+fh board --snapshot --pane overview --path <task dir>
+```
+
+Colour carries the confidence bands in the live pane and is dropped in a
+snapshot; the braille still carries the shape.
 
 Keys: `q` quit, `1`–`5`/`Tab` panes, `j/k` select, `f` follow the best candidate.
 
