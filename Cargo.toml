@@ -1,0 +1,39 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+authors = ["folding-harness contributors"]
+
+[workspace.dependencies]
+# --- internal ---
+fh-core = { path = "crates/fh-core" }
+fh-contract = { path = "crates/fh-contract" }
+fh-fold = { path = "crates/fh-fold" }
+fh-skills = { path = "crates/fh-skills" }
+fh-agent = { path = "crates/fh-agent" }
+fh-trace = { path = "crates/fh-trace" }
+fh-orchestrator = { path = "crates/fh-orchestrator" }
+fh-tui = { path = "crates/fh-tui" }
+
+# --- external ---
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "signal"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+rand = "0.8"
+
+[profile.release]
+lto = "thin"
+strip = true
