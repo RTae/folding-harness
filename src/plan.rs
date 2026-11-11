@@ -25,8 +25,8 @@ use crate::{
 pub enum PlanError {
     #[error(transparent)]
     Provider(#[from] AgentError),
-    #[error("the reply contained no JSON object")]
-    NoJson,
+    #[error("the reply contained no JSON object. The model said:\n\n{raw}")]
+    NoJson { raw: String },
     #[error("the JSON did not match the plan schema: {source}\n\nreply was:\n{raw}")]
     Schema {
         #[source]
@@ -331,7 +331,9 @@ pub fn plan_from_reply(
     target: &[Chain],
     seed: u64,
 ) -> Result<Plan, PlanError> {
-    let json = extract_json(reply).ok_or(PlanError::NoJson)?;
+    let json = extract_json(reply).ok_or_else(|| PlanError::NoJson {
+        raw: reply.trim().chars().take(1500).collect(),
+    })?;
     let draft: PlanDraft = serde_json::from_str(json).map_err(|source| PlanError::Schema {
         source,
         raw: json.chars().take(1200).collect(),

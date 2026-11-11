@@ -18,6 +18,8 @@ use fh::trace::{RunManifest, TaskPaths};
 use fh::{Capability, ExecutionMode, SearchState, SkillId, TaskConfig, TaskId};
 
 const EXAMPLE_TASK: &str = include_str!("../examples/vhh_demo.yaml");
+const EXAMPLE_BINDER: &str = include_str!("../examples/binder.fasta");
+const EXAMPLE_TARGET: &str = include_str!("../examples/target.fasta");
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +57,9 @@ struct ProviderOptions {
     /// default on a custom endpoint; set it if the endpoint supports it.
     #[arg(long)]
     effort: Option<String>,
+    /// Response token cap. Lower it if an endpoint rejects the default.
+    #[arg(long)]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -263,7 +268,41 @@ fn init(path: PathBuf, force: bool) -> Result<()> {
     }
     std::fs::write(&path, EXAMPLE_TASK).with_context(|| format!("writing {}", path.display()))?;
     println!("wrote {}", path.display());
-    println!("next: fh validate {}", path.display());
+
+    // The FASTA files go beside the config, because `fh chat` and `fh task`
+    // need sequences as files or arguments and the first thing anyone does is
+    // reach for the example ones.
+    let directory = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut sequences = Vec::new();
+    for (name, contents) in [
+        ("binder.fasta", EXAMPLE_BINDER),
+        ("target.fasta", EXAMPLE_TARGET),
+    ] {
+        let destination = directory.join(name);
+        if destination.exists() && !force {
+            println!("kept {} (already there)", destination.display());
+        } else {
+            std::fs::write(&destination, contents)
+                .with_context(|| format!("writing {}", destination.display()))?;
+            println!("wrote {}", destination.display());
+        }
+        sequences.push(destination);
+    }
+
+    println!();
+    println!("The sequences in these files are placeholders. Replace them before");
+    println!("doing anything real; the target is synthetic, not a known protein.");
+    println!();
+    println!("next:");
+    println!("  fh validate {}", path.display());
+    println!("  fh run {}", path.display());
+    if let [binder, target] = sequences.as_slice() {
+        println!(
+            "  fh chat --binder {} --target {}   (needs ANTHROPIC_API_KEY)",
+            binder.display(),
+            target.display()
+        );
+    }
     Ok(())
 }
 
@@ -539,7 +578,25 @@ fn make_provider(options: &ProviderOptions) -> Result<AnthropicProvider> {
     if let Some(effort) = &options.effort {
         provider = provider.with_effort(Some(effort.clone()));
     }
+    if let Some(max_tokens) = options.max_tokens {
+        provider = provider.with_max_tokens(max_tokens);
+    }
     Ok(provider)
+}
+
+/// A gateway can return its own error as an ordinary HTTP 200 reply, which
+/// then reads as though the model said it. Say where the text came from.
+fn third_party_note(provider: &AnthropicProvider) -> String {
+    if provider.is_first_party() {
+        return String::new();
+    }
+    format!(
+        "\n\nThat came back from {} with HTTP 200. A gateway may return its own error as an \
+         ordinary reply, so the text above is not necessarily the model's words. Try another \
+         --model (this endpoint is known to behave differently per model), a lower \
+         --max-tokens, or the first-party API.",
+        provider.host()
+    )
 }
 
 fn confirm(question: &str) -> Result<bool> {
@@ -610,7 +667,7 @@ async fn task_from_prose(
     println!("asking for a plan...");
     let plan = fh::plan::draft(&provider, &prose, &binder_chains, &target_chains, seed)
         .await
-        .map_err(|error| anyhow!("{error}"))?;
+        .map_err(|error| anyhow!("{error}{}", third_party_note(&provider)))?;
 
     println!();
     for line in plan.summary() {

@@ -74,10 +74,15 @@ Prefer not to install? `cargo build --release` and use
 No GPU, no network, no API key: the default backend is a deterministic fixture.
 
 ```bash
-fh init task.yaml        # write an example task config
+fh init                  # writes task.yaml, binder.fasta and target.fasta
 fh validate task.yaml    # check it, and print what may and may not change
 fh run task.yaml         # run it, streaming events to stdout
 ```
+
+`fh init` writes the two FASTA files beside the config because `fh chat` and
+`fh task` take sequences as files or arguments. Both are placeholders — the
+target is synthetic, not a known protein — so replace them before doing
+anything real.
 
 `fh validate` is worth reading before the first run — it prints the mutable
 scope, which is the thing most likely to be wrong, and the routing table, which
@@ -165,7 +170,8 @@ fh doctor --probe-model \
 
 `--probe-model` sends one tiny request and prints what came back, so a wrong
 URL, key or model name is a one-line answer rather than a failure in the middle
-of a plan. The same four flags work on `fh chat` and `fh task`, and
+of a plan. Probe each model you intend to use: a gateway can serve one model
+happily and fail on another. The same four flags work on `fh chat` and `fh task`, and
 `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL` and `ANTHROPIC_API_VERSION` set them
 from the environment.
 
@@ -178,6 +184,9 @@ Two things change when the URL is not the first-party API:
   `--effort high` to send it anyway if your endpoint supports it.
 - **The host is printed before any prompt is sent**, and flagged as
   third-party. Prompts leave for that host, so whoever runs it can read them.
+  A gateway may also return its own errors as ordinary HTTP 200 replies, which
+  read as though the model said them — when a reply cannot be parsed, the
+  harness prints it verbatim and says which host it came from.
   The harness only ever sends chain labels and lengths when drafting a plan,
   never your sequences, but that is a property of this one code path rather
   than a guarantee about anything you type into the chat.

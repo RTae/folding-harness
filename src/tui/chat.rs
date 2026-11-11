@@ -269,7 +269,7 @@ task.yaml, or keep talking to change it.",
                 ));
                 self.plan = Some(plan);
             }
-            Err(plan::PlanError::NoJson) => {
+            Err(plan::PlanError::NoJson { .. }) => {
                 // Conversation without a plan in it is normal.
             }
             Err(error) => {

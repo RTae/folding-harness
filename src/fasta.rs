@@ -20,6 +20,38 @@ pub enum FastaError {
     EmptyRecord { label: String },
     #[error("no records found")]
     Empty,
+    #[error(
+        "'{value}' is neither a readable file nor a bare amino-acid sequence.{hint}\n\
+         Pass a path to a FASTA file, or the sequence itself \
+         (e.g. --binder QVQLVESGGGLVQ...).\n\
+         `fh init` writes example binder.fasta and target.fasta into the current directory."
+    )]
+    NotFileOrSequence { value: String, hint: String },
+}
+
+/// Look for the same filename in the places it usually turns out to be, so a
+/// missing file names its own fix rather than only its absence.
+fn nearby(value: &str) -> Vec<std::path::PathBuf> {
+    let path = std::path::Path::new(value);
+    let Some(name) = path.file_name() else {
+        return Vec::new();
+    };
+
+    let mut candidates = vec![
+        std::path::PathBuf::from("examples").join(name),
+        std::path::PathBuf::from(name),
+    ];
+    // Beside the file they asked for, if they gave a directory.
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        candidates.push(parent.join("examples").join(name));
+    }
+
+    let mut found: Vec<std::path::PathBuf> = candidates
+        .into_iter()
+        .filter(|candidate| candidate != path && candidate.is_file())
+        .collect();
+    found.dedup();
+    found
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,14 +156,23 @@ pub fn load_or_literal(value: &str, fallback_label: &str) -> Result<Vec<Record>,
         }
         return Ok(records);
     }
-    // Not a file and not a sequence: report it as a missing file, which is
-    // what the user most likely meant.
-    Err(FastaError::Io {
-        path: value.to_string(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "not a readable file, and not a bare amino-acid sequence",
-        ),
+    let found = nearby(value);
+    let hint = if found.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nThere is a file of that name here, though: {}",
+            found
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    Err(FastaError::NotFileOrSequence {
+        value: value.to_string(),
+        hint,
     })
 }
 
