@@ -2,13 +2,11 @@
 //!
 //! Everything above this crate talks to [`FoldBackend`], never to a model. The
 //! three implementations shipped here are the deterministic [`fixture`] (no
-//! GPU, no network), the [`http`] client for a real compute service, and —
-//! behind the `server` feature — a [`server`] that puts any backend behind the
-//! `fh.fold/v1` HTTP contract.
+//! GPU, no network), the [`http`] client for a real compute service, and a
+//! [`server`] that puts any backend behind the `fh.fold/v1` HTTP contract.
 
 pub mod fixture;
 pub mod http;
-
 pub mod server;
 
 use async_trait::async_trait;
