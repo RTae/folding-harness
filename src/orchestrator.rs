@@ -296,7 +296,8 @@ impl Orchestrator {
 
         self.manifest.finished_at_ms = Some(now_ms());
         self.manifest.folds = self.folds;
-        self.manifest.usage = self.meter.snapshot();
+        // The meter holds the fold counts; the agent reports the model spend.
+        self.manifest.usage = self.meter.snapshot().summed_with(self.agent.usage());
         self.manifest.best_candidate = best.as_ref().map(|candidate| candidate.id);
         self.manifest.best_loss = best.as_ref().and_then(|candidate| candidate.loss);
         self.save_manifest()?;
@@ -1094,6 +1095,113 @@ fold:
         assert!(records
             .iter()
             .any(|record| matches!(&record.event, Event::Rejected { .. })));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Delegates every decision to the heuristic and reports a fixed model
+    /// spend, standing in for a run driven by a provider that counts.
+    struct SpendingAgent {
+        inner: HeuristicAgent,
+        spent: crate::usage::Usage,
+    }
+
+    #[async_trait::async_trait]
+    impl DesignAgent for SpendingAgent {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        async fn choose(
+            &mut self,
+            legal: &[SkillId],
+            state: &crate::SearchState,
+        ) -> Result<crate::agent::Decision, AgentError> {
+            self.inner.choose(legal, state).await
+        }
+
+        fn usage(&self) -> crate::usage::Usage {
+            self.spent
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_reports_spend_has_it_folded_into_the_manifest() {
+        let dir = temp_dir("agent-spend");
+        let mut config = TaskConfig::from_yaml(YAML).expect("config parses");
+        config.design.cycles = 2;
+        let (scaffold, scope) = config.resolve().expect("resolves");
+
+        let spent = crate::usage::Usage {
+            calls: 3,
+            input_tokens: 900,
+            output_tokens: 120,
+            folds: 0,
+            fold_ms: 0,
+        };
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 11));
+        let mut orchestrator = Orchestrator::prepare(
+            config,
+            backend,
+            Box::new(SpendingAgent {
+                inner: HeuristicAgent::new(11),
+                spent,
+            }),
+            crate::trace::TaskPaths::new(&dir),
+            TaskId("agent-spend".to_string()),
+        )
+        .await
+        .expect("prepares");
+
+        orchestrator.run().await.expect("completes");
+
+        let manifest: RunManifest =
+            crate::trace::read_json(crate::trace::TaskPaths::new(&dir).manifest())
+                .expect("manifest reads");
+        assert_eq!(manifest.usage.calls, spent.calls);
+        assert_eq!(manifest.usage.input_tokens, spent.input_tokens);
+        assert_eq!(manifest.usage.output_tokens, spent.output_tokens);
+        assert!(
+            manifest.usage.folds > 0,
+            "the run's own folds must still land in the usage"
+        );
+        assert_eq!(manifest.usage.folds, manifest.folds as u64);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_makes_no_model_calls_leaves_the_manifest_carrying_only_folds() {
+        let dir = temp_dir("no-model-spend");
+        let mut config = TaskConfig::from_yaml(YAML).expect("config parses");
+        config.design.cycles = 2;
+        let (scaffold, scope) = config.resolve().expect("resolves");
+
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 12));
+        let mut orchestrator = Orchestrator::prepare(
+            config,
+            backend,
+            Box::new(HeuristicAgent::new(12)),
+            crate::trace::TaskPaths::new(&dir),
+            TaskId("no-model-spend".to_string()),
+        )
+        .await
+        .expect("prepares");
+
+        orchestrator.run().await.expect("completes");
+
+        let manifest: RunManifest =
+            crate::trace::read_json(crate::trace::TaskPaths::new(&dir).manifest())
+                .expect("manifest reads");
+        assert_eq!(manifest.usage.calls, 0);
+        assert_eq!(manifest.usage.total_tokens(), 0);
+        assert_eq!(manifest.usage.folds, manifest.folds as u64);
+        assert!(manifest.usage.folds > 0);
+        // The summary names the spend that happened and never claims a token
+        // count for calls that were not made.
+        let summary = manifest.usage.summary();
+        assert!(summary.contains("fold(s)"), "{summary}");
+        assert!(!summary.contains("call(s)"), "{summary}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

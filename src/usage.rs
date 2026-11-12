@@ -32,6 +32,19 @@ impl Usage {
         self.input_tokens + self.output_tokens
     }
 
+    /// Both snapshots added together, field by field. One meter may hold the
+    /// fold counts while another source reports the model spend, and the
+    /// manifest carries the total.
+    pub fn summed_with(self, other: Usage) -> Usage {
+        Usage {
+            calls: self.calls + other.calls,
+            input_tokens: self.input_tokens + other.input_tokens,
+            output_tokens: self.output_tokens + other.output_tokens,
+            folds: self.folds + other.folds,
+            fold_ms: self.fold_ms + other.fold_ms,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         *self == Usage::default()
     }
@@ -150,6 +163,35 @@ mod tests {
         assert_eq!(usage.fold_ms, 1500);
         assert_eq!(usage.total_tokens(), 170);
         assert_eq!(meter.snapshot(), other.snapshot());
+    }
+
+    #[test]
+    fn summed_with_adds_every_counter_and_leaves_the_other_snapshot_alone() {
+        let folds = Usage {
+            calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            folds: 4,
+            fold_ms: 900,
+        };
+        let calls = Usage {
+            calls: 2,
+            input_tokens: 300,
+            output_tokens: 40,
+            folds: 0,
+            fold_ms: 0,
+        };
+        assert_eq!(
+            folds.summed_with(calls),
+            Usage {
+                calls: 2,
+                input_tokens: 300,
+                output_tokens: 40,
+                folds: 4,
+                fold_ms: 900,
+            }
+        );
+        assert_eq!(folds.summed_with(Usage::default()), folds);
     }
 
     #[test]
