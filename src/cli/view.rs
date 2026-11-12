@@ -100,7 +100,8 @@ pub(super) async fn serve(port: u16, task: Option<PathBuf>, latency: Duration) -
         }
     };
 
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    // Loopback by default: the service authenticates nobody.
+    let addr = fh::fold::server::loopback_addr(port);
     println!("serving {} on http://{addr}", fh::contract::PROTOCOL);
     println!("  GET  http://{addr}{}", fh::contract::routes::HEALTH);
     println!("  POST http://{addr}{}", fh::contract::routes::FOLD);

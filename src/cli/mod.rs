@@ -10,7 +10,6 @@ mod run;
 mod setup;
 mod view;
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -201,7 +200,7 @@ pub enum Command {
         #[arg(long)]
         task_root: Option<PathBuf>,
     },
-    /// Serve a stub compute service speaking the fold contract.
+    /// Serve a stub compute service speaking the fold contract on localhost.
     Serve {
         #[arg(long, default_value_t = 8080)]
         port: u16,
