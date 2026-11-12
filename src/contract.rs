@@ -163,6 +163,10 @@ pub enum StructureFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CaResidue {
     pub chain_index: u8,
+    /// Zero-based position of the residue within its chain, in the order the
+    /// chain was sent. The base is part of the contract, so a consumer can
+    /// compare a trace positionally against the sequence it sent and reject a
+    /// service that renumbered.
     pub index: u32,
     pub residue: char,
     pub xyz: [f32; 3],

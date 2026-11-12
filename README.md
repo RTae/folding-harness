@@ -10,12 +10,12 @@ watching a run over SSH without forwarding a port, a terminal chat screen for
 setting a run up by describing it, and a local web view for when a browser
 renders better than a terminal does.
 
-> **Status: working proof of concept.** The cycle, the contract, the gates, the
-> population, the trace, the manifest, the dashboard, the chat screen, the web
-> view and the chat history are implemented, and 194 tests pass. Count them
-> with `cargo test` and sum the `passed` figures in its `test result` lines.
-> `fh run` completes end to end both in-process and over HTTP, and produces
-> the identical run either way.
+> **Status: working proof of concept.** The cycle, the contract, the gates,
+> output re-verification, the population, the trace, the manifest, the
+> dashboard, the chat screen, the web view and the chat history are
+> implemented, and 208 tests pass. Count them with `cargo test` and sum the
+> `passed` figures in its `test result` lines. `fh run` completes end to end
+> both in-process and over HTTP, and produces the identical run either way.
 >
 > Not done yet: the model-backed skills, inverse folding and likelihood-guided
 > mutation, are declared in the contract and gated by the router but have no
@@ -498,20 +498,17 @@ Nearest first.
    Licensing is not uniform even within one repository. Some projects' LICENSE
    covers weights explicitly, some are silent, and some put weights under a
    separate agreement. Record which, per backend, in its adapter.
-2. **Output re-verification.** Check the returned structure's sequence against
-   the proposal, so a backend that silently renumbers or substitutes is caught
-   rather than scored.
-3. **Inverse-folding and likelihood-guided executors**, behind the capabilities
+2. **Inverse-folding and likelihood-guided executors**, behind the capabilities
    the router already checks.
-4. **Resume.** The trace and manifest are enough to rebuild a population and
+3. **Resume.** The trace and manifest are enough to rebuild a population and
    continue. `TraceWriter::append` exists for it.
-5. **Prompt caching in the chat screen.** A long conversation resends its whole
+4. **Prompt caching in the chat screen.** A long conversation resends its whole
    history each turn. Caching the system prompt would cut that, and it only
    works against the first-party API.
-6. **An MCP server.** `rmcp` is the official Rust SDK, and MCP's Tasks
+5. **An MCP server.** `rmcp` is the official Rust SDK, and MCP's Tasks
    extension is a close match for this job contract. That is how the harness
    gets driven by an agent instead of only driving one.
-7. **Cost accounting.** GPU-seconds and token spend per run, which the open
+6. **Cost accounting.** GPU-seconds and token spend per run, which the open
    harnesses in this space generally do not surface.
 
 ## Licence
