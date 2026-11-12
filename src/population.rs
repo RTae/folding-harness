@@ -77,7 +77,7 @@ impl Population {
 
     /// Rebuild a population from members an earlier run recorded, so a
     /// resumed search refuses the same duplicates the recorded one would.
-    /// The fingerprint map comes from the members; `admitted` and `rejected`
+    /// The fingerprint map comes from the members. `admitted` and `rejected`
     /// are the counters the recording run reported. No I/O happens here: the
     /// caller parses the snapshot and passes the values in.
     pub fn restore(
