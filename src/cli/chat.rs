@@ -1,5 +1,6 @@
 //! The conversational entry points: the chat screen, one-shot prose, and the
 //! record of past conversations.
+use super::run::run_config;
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
