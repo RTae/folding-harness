@@ -101,6 +101,12 @@ Two separations carry the design and should survive refactors:
 - Tests live beside the code in `#[cfg(test)] mod tests`, named after the
   behaviour they pin rather than the function they call.
 - No test sleeps and no test depends on a time window.
+- The test runner takes no seed, so a rule that asks for three runs under
+  three seeds translates rather than applies. `rust-toolchain.toml` pins
+  stable, and libtest's `--shuffle` seed is nightly only. Run the suite three
+  times, once with `--test-threads=1`, and say that the runs varied by thread
+  scheduling rather than by seed. Run randomness comes from `design.seed`
+  inside the tests and is meant to stay fixed.
 - Randomness goes through `crate::RunRng` (ChaCha8) seeded from `design.seed`,
   never from entropy. A run must replay from its manifest. ChaCha8 rather than
   `StdRng` because `rand` documents `StdRng`'s output as unstable across
@@ -123,6 +129,24 @@ Two separations carry the design and should survive refactors:
 - Before any command that could discard work, run `git status`. Note that
   `.gitignore` excludes `/task.yaml`, `/tasks/` and `/runs/`, so run artifacts
   are never tracked.
+
+## Running work in parallel
+
+When two changes touch no file in common, start them at the same time rather
+than one after the other. Give each its own git worktree and branch, so a check
+run reads the code under change and not the copy on `main`.
+
+- Create each isolation with `git worktree add -b <branch> <path> main`, and
+  read the commit it landed on. `main` moves while work is in flight, and a
+  branch that predates a doc fix conflicts with it.
+- Keep exactly one owner per file. Two changes editing one file corrupt each
+  other, and a check run in one tree tells you nothing about the other.
+- Merge back only when asked. Confirm a commit landed with `git log` and
+  `git status` rather than trusting an exit code, because more than one session
+  may share this tree and commit first.
+- Never reword or rebase a commit another session made.
+- Prepare work that needs an approval, then bring the question. A push, a
+  merge, a launch and a delete all wait for a yes.
 
 ## Writing and documentation
 
