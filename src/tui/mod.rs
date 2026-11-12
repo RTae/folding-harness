@@ -12,6 +12,8 @@
 //! a crashed dashboard cannot disturb a design run.
 
 pub mod chat;
+pub mod command;
+pub mod input;
 pub mod structure;
 
 use std::collections::HashMap;

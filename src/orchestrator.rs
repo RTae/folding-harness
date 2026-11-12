@@ -169,7 +169,7 @@ impl Orchestrator {
     pub fn attributed_to(mut self, chat_id: Option<String>) -> Result<Self, RunError> {
         if chat_id.is_some() {
             self.manifest.chat_id = chat_id;
-            fh_trace_write_manifest(&self.paths, &self.manifest)?;
+            self.save_manifest()?;
         }
         Ok(self)
     }
@@ -185,6 +185,13 @@ impl Orchestrator {
 
     pub fn population(&self) -> &Population {
         &self.population
+    }
+
+    /// Write `run.json`. Called whenever a field of the manifest changes, so a
+    /// run that stops early still leaves an accurate one on disk.
+    fn save_manifest(&self) -> Result<(), RunError> {
+        crate::trace::write_json(self.paths.manifest(), &self.manifest)?;
+        Ok(())
     }
 
     fn emit(&mut self, event: Event) -> Result<(), RunError> {
@@ -287,7 +294,7 @@ impl Orchestrator {
         self.manifest.usage = self.meter.snapshot();
         self.manifest.best_candidate = best.as_ref().map(|candidate| candidate.id);
         self.manifest.best_loss = best.as_ref().and_then(|candidate| candidate.loss);
-        crate::trace::write_json(self.paths.manifest(), &self.manifest)?;
+        self.save_manifest()?;
         self.snapshot(self.manifest.cycles_completed, false)?;
 
         Ok(RunSummary {
@@ -725,11 +732,6 @@ impl Orchestrator {
         }
         Ok(())
     }
-}
-
-fn fh_trace_write_manifest(paths: &TaskPaths, manifest: &RunManifest) -> Result<(), RunError> {
-    crate::trace::write_json(paths.manifest(), manifest)?;
-    Ok(())
 }
 
 fn describe_admission(outcome: AdmissionOutcome) -> String {

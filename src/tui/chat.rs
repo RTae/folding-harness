@@ -34,6 +34,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
+use super::command::{self, Slash};
+use super::input::{wrap, TextInput};
 use crate::agent::{ChatMessage, ModelProvider};
 use crate::history::{ChatRecord, StoredRole};
 use crate::plan::{self, Chain, Plan};
@@ -79,437 +81,6 @@ impl Entry {
             _ => Color::Gray,
         }
     }
-}
-
-/// Wrap text to a width, preserving explicit newlines. Done by hand so the
-/// transcript's line count is known exactly and scrolling is predictable.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(8);
-    let mut out = Vec::new();
-    for paragraph in text.split('\n') {
-        if paragraph.trim().is_empty() {
-            out.push(String::new());
-            continue;
-        }
-
-        // Keep the line's own indentation and repeat it on continuations, so
-        // nested JSON stays readable instead of collapsing to a flat block.
-        let body = paragraph.trim_start();
-        let depth = paragraph.chars().count() - body.chars().count();
-        let indent = " ".repeat(depth.min(width.saturating_sub(8)));
-        let width = width - indent.chars().count();
-
-        let mut line = String::new();
-        let push = |line: String, out: &mut Vec<String>| {
-            out.push(format!("{indent}{line}"));
-        };
-
-        for word in body.split_whitespace() {
-            if line.is_empty() {
-                // A single word longer than the pane is hard-split.
-                if word.chars().count() > width {
-                    let mut rest = word;
-                    while rest.chars().count() > width {
-                        let head: String = rest.chars().take(width).collect();
-                        push(head, &mut out);
-                        rest = &rest[rest
-                            .char_indices()
-                            .nth(width)
-                            .map(|(index, _)| index)
-                            .unwrap_or(rest.len())..];
-                    }
-                    line.push_str(rest);
-                } else {
-                    line.push_str(word);
-                }
-            } else if line.chars().count() + 1 + word.chars().count() <= width {
-                line.push(' ');
-                line.push_str(word);
-            } else {
-                push(std::mem::take(&mut line), &mut out);
-                line.push_str(word);
-            }
-        }
-        if !line.is_empty() {
-            push(line, &mut out);
-        }
-    }
-    out
-}
-
-/// A single-line editor with a cursor and a history ring.
-///
-/// Hand-written because `ratatui` draws widgets and leaves input to the
-/// application. Chars are the unit throughout, so a multi-byte character
-/// counts as one position.
-#[derive(Debug, Default)]
-pub struct TextInput {
-    chars: Vec<char>,
-    cursor: usize,
-    history: Vec<String>,
-    /// Where we are when scrolling back; `None` means "editing a fresh line".
-    recall: Option<usize>,
-    /// The line being edited, stashed while scrolling through history.
-    stashed: Option<Vec<char>>,
-}
-
-impl TextInput {
-    pub fn text(&self) -> String {
-        self.chars.iter().collect()
-    }
-
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.chars.is_empty()
-    }
-
-    fn insert(&mut self, character: char) {
-        self.chars
-            .insert(self.cursor.min(self.chars.len()), character);
-        self.cursor += 1;
-    }
-
-    /// Insert pasted text at the cursor, newlines and all.
-    ///
-    /// A paste arrives as one event when the terminal has bracketed paste, so
-    /// its newlines are content rather than a run of Enter presses. One
-    /// trailing newline is dropped: copying a line usually takes its line
-    /// ending with it, and nobody means to end on a blank line.
-    fn insert_str(&mut self, text: &str) {
-        let text = text.strip_suffix('\n').unwrap_or(text);
-        let text = text.strip_suffix('\r').unwrap_or(text);
-        for character in text.chars() {
-            // Carriage returns and tabs would corrupt the layout.
-            match character {
-                '\r' => continue,
-                '\t' => {
-                    for _ in 0..4 {
-                        self.insert(' ');
-                    }
-                }
-                _ => self.insert(character),
-            }
-        }
-    }
-
-    /// The logical lines of the buffer.
-    fn lines(&self) -> Vec<String> {
-        self.text()
-            .split('\n')
-            .map(|line| line.to_string())
-            .collect()
-    }
-
-    fn line_count(&self) -> usize {
-        1 + self.chars.iter().filter(|c| **c == '\n').count()
-    }
-
-    /// Where the cursor sits, as a line and a column within it.
-    fn row_col(&self) -> (usize, usize) {
-        let mut row = 0;
-        let mut col = 0;
-        for character in self.chars.iter().take(self.cursor) {
-            if *character == '\n' {
-                row += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
-        }
-        (row, col)
-    }
-
-    /// Index of the first character of a given line.
-    fn line_start(&self, row: usize) -> usize {
-        let mut seen = 0;
-        for (index, character) in self.chars.iter().enumerate() {
-            if seen == row {
-                return index;
-            }
-            if *character == '\n' {
-                seen += 1;
-            }
-        }
-        self.chars.len()
-    }
-
-    fn line_len(&self, row: usize) -> usize {
-        self.lines()
-            .get(row)
-            .map(|line| line.chars().count())
-            .unwrap_or(0)
-    }
-
-    /// Up and Down move between lines when the message has several, and
-    /// otherwise walk the history, which is what a shell does.
-    fn up(&mut self) {
-        let (row, col) = self.row_col();
-        if row == 0 {
-            self.recall_older();
-            return;
-        }
-        let target = row - 1;
-        self.cursor = self.line_start(target) + col.min(self.line_len(target));
-    }
-
-    fn down(&mut self) {
-        let (row, col) = self.row_col();
-        if row + 1 >= self.line_count() {
-            self.recall_newer();
-            return;
-        }
-        let target = row + 1;
-        self.cursor = self.line_start(target) + col.min(self.line_len(target));
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            self.chars.remove(self.cursor);
-        }
-    }
-
-    fn delete(&mut self) {
-        if self.cursor < self.chars.len() {
-            self.chars.remove(self.cursor);
-        }
-    }
-
-    /// Ctrl-W: delete the word before the cursor, including trailing spaces.
-    fn delete_word(&mut self) {
-        while self.cursor > 0 && self.chars[self.cursor - 1].is_whitespace() {
-            self.cursor -= 1;
-            self.chars.remove(self.cursor);
-        }
-        while self.cursor > 0 && !self.chars[self.cursor - 1].is_whitespace() {
-            self.cursor -= 1;
-            self.chars.remove(self.cursor);
-        }
-    }
-
-    fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    fn right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.chars.len());
-    }
-
-    fn home(&mut self) {
-        let (row, _) = self.row_col();
-        self.cursor = self.line_start(row);
-    }
-
-    fn end(&mut self) {
-        let (row, _) = self.row_col();
-        self.cursor = self.line_start(row) + self.line_len(row);
-    }
-
-    fn clear(&mut self) {
-        self.chars.clear();
-        self.cursor = 0;
-        self.recall = None;
-        self.stashed = None;
-    }
-
-    /// Take the line, push it onto the history, and reset.
-    fn take(&mut self) -> String {
-        let text: String = self.chars.iter().collect();
-        if !text.trim().is_empty() && self.history.last().map(String::as_str) != Some(text.as_str())
-        {
-            self.history.push(text.clone());
-        }
-        self.clear();
-        text
-    }
-
-    fn set(&mut self, text: &str) {
-        self.chars = text.chars().collect();
-        self.cursor = self.chars.len();
-    }
-
-    /// Up: an older line from the history.
-    fn recall_older(&mut self) {
-        if self.history.is_empty() {
-            return;
-        }
-        let next = match self.recall {
-            None => {
-                self.stashed = Some(self.chars.clone());
-                self.history.len() - 1
-            }
-            Some(0) => 0,
-            Some(index) => index - 1,
-        };
-        self.recall = Some(next);
-        let text = self.history[next].clone();
-        self.set(&text);
-    }
-
-    /// Down: a newer line, then back to whatever was being typed.
-    fn recall_newer(&mut self) {
-        match self.recall {
-            None => {}
-            Some(index) if index + 1 < self.history.len() => {
-                self.recall = Some(index + 1);
-                let text = self.history[index + 1].clone();
-                self.set(&text);
-            }
-            Some(_) => {
-                self.recall = None;
-                let stashed = self.stashed.take().unwrap_or_default();
-                self.chars = stashed;
-                self.cursor = self.chars.len();
-            }
-        }
-    }
-
-    /// The lines to draw and where the cursor sits among them.
-    ///
-    /// Only the cursor's own line scrolls horizontally, so the rest stay put
-    /// while you move along a long line.
-    fn view(&self, width: usize, max_rows: usize) -> (Vec<String>, usize, usize) {
-        let width = width.max(4);
-        let max_rows = max_rows.max(1);
-        let lines = self.lines();
-        let (row, col) = self.row_col();
-
-        // Scroll vertically so the cursor's line is on screen.
-        let first = if row >= max_rows {
-            row + 1 - max_rows
-        } else {
-            0
-        };
-        let visible: Vec<String> = lines.iter().skip(first).take(max_rows).cloned().collect();
-
-        let cursor_row = row - first;
-        let mut shown = visible;
-        let mut cursor_col = col;
-        if let Some(line) = shown.get_mut(cursor_row) {
-            if line.chars().count() >= width {
-                let start = col.saturating_sub(width - 1);
-                *line = line.chars().skip(start).take(width).collect();
-                cursor_col = col - start;
-            }
-        }
-        (shown, cursor_row, cursor_col)
-    }
-}
-
-/// A slash command typed into the message line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Slash {
-    Help,
-    Provider,
-    Spend,
-    SetModel(String),
-    SetUrl(String),
-    Retry,
-    Run,
-    Save(Option<String>),
-    Plan,
-    Model,
-    Clear,
-    Quit,
-    Unknown(String),
-}
-
-fn parse_slash(line: &str) -> Option<Slash> {
-    let line = line.trim();
-    let rest = line.strip_prefix('/')?;
-    let mut parts = rest.splitn(2, char::is_whitespace);
-    let name = parts.next().unwrap_or("").to_ascii_lowercase();
-    let argument = parts.next().map(|text| text.trim().to_string());
-    Some(match name.as_str() {
-        "help" | "h" | "?" => Slash::Help,
-        "provider" => Slash::Provider,
-        "spend" | "usage" | "cost" => Slash::Spend,
-        "model" | "m" => match argument {
-            Some(value) if !value.is_empty() => Slash::SetModel(value),
-            _ => Slash::Model,
-        },
-        "url" => match argument {
-            Some(value) if !value.is_empty() => Slash::SetUrl(value),
-            _ => Slash::Provider,
-        },
-        "retry" => Slash::Retry,
-        "run" | "r" => Slash::Run,
-        "save" | "s" => Slash::Save(argument.filter(|text| !text.is_empty())),
-        "plan" | "p" => Slash::Plan,
-        "clear" => Slash::Clear,
-        "quit" | "q" | "exit" => Slash::Quit,
-        other => Slash::Unknown(other.to_string()),
-    })
-}
-
-/// The commands, their argument hint, and what they do.
-///
-/// One table drives the suggestion list and the help text, so the two cannot
-/// drift apart.
-const COMMANDS: &[(&str, &str, &str)] = &[
-    ("/help", "", "this list"),
-    (
-        "/provider",
-        "",
-        "choose where prompts go, from your saved profiles",
-    ),
-    ("/spend", "", "tokens this session has used"),
-    (
-        "/model",
-        " <name>",
-        "use a different model, and remember it",
-    ),
-    (
-        "/url",
-        " <url>",
-        "use a different endpoint, and remember it",
-    ),
-    ("/retry", "", "ask again, for a reply that was cut off"),
-    ("/plan", "", "show the current plan summary again"),
-    ("/run", "", "run the validated plan (same as Ctrl-R)"),
-    (
-        "/save",
-        " [path]",
-        "write the plan to task.yaml, or to [path]",
-    ),
-    (
-        "/clear",
-        "",
-        "forget the conversation so far and start over",
-    ),
-    ("/quit", "", "leave without running (same as Esc)"),
-];
-
-const KEY_HELP: &str = "Enter sends, Alt-Enter adds a line. Pasting several lines keeps them as one
-message. Left/Right and Home/End move within a line, Ctrl-W deletes a word,
-Ctrl-U clears the message, Up/Down move between lines or recall what you typed
-before. Tab completes a command. PgUp/PgDn scroll the transcript.";
-
-fn help_text() -> String {
-    let mut out = String::new();
-    for (name, argument, what) in COMMANDS {
-        out.push_str(&format!("{:<16}{what}\n", format!("{name}{argument}")));
-    }
-    out.push('\n');
-    out.push_str(KEY_HELP);
-    out
-}
-
-/// Commands matching what has been typed, while the message is still a bare
-/// `/word`. An argument having been started means the command is chosen.
-fn suggestions(input: &str) -> Vec<&'static (&'static str, &'static str, &'static str)> {
-    let trimmed = input.trim_start();
-    if !trimmed.starts_with('/') || trimmed.contains(char::is_whitespace) {
-        return Vec::new();
-    }
-    let lowered = trimmed.to_ascii_lowercase();
-    COMMANDS
-        .iter()
-        .filter(|(name, _, _)| name.starts_with(&lowered))
-        .collect()
 }
 
 pub struct ChatApp {
@@ -686,7 +257,7 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
         if self.suggestions_hidden {
             return Vec::new();
         }
-        suggestions(&self.input.text())
+        command::suggestions(&self.input.text())
     }
 
     /// Tab: finish the highlighted command and leave the cursor ready for an
@@ -867,7 +438,7 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
         }
         let line = self.input.take();
 
-        if let Some(command) = parse_slash(&line) {
+        if let Some(command) = command::parse_slash(&line) {
             self.run_slash(command);
             return;
         }
@@ -880,7 +451,7 @@ says it does. Nothing runs until you press Ctrl-R. Type /help for commands.",
 
     fn run_slash(&mut self, command: Slash) {
         match command {
-            Slash::Help => self.note(help_text()),
+            Slash::Help => self.note(command::help_text()),
             Slash::Quit => self.quit = true,
             Slash::Model => {
                 let text = format!(
@@ -1242,7 +813,7 @@ task.yaml, or keep talking to change it."
             KeyCode::Esc => self.quit = true,
             // `?` is a character you might want to type, so the shortcut is
             // F1; /help does the same thing.
-            KeyCode::F(1) => self.note(help_text()),
+            KeyCode::F(1) => self.note(command::help_text()),
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => {
                 self.input.backspace();
@@ -1753,6 +1324,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut ChatApp) -> io::
 mod tests {
     use super::*;
     use crate::agent::{AgentError, ChatRole};
+    use crate::tui::command::COMMANDS;
 
     struct StubProvider {
         reply: String,
@@ -1792,48 +1364,6 @@ mod tests {
     }
 
     const GOOD_PLAN: &str = r#"{"name":"demo","topology":"vhh","regions":[{"name":"loop1","chain":"H","start":26,"end":33}],"cycles":4}"#;
-
-    #[test]
-    fn wrapping_respects_width_and_newlines() {
-        let lines = wrap("one two three four five", 9);
-        assert!(
-            lines.iter().all(|line| line.chars().count() <= 9),
-            "{lines:?}"
-        );
-        assert_eq!(wrap("a\n\nb", 20), vec!["a", "", "b"]);
-
-        let long = wrap("QVQLVESGGGLVQAGGSLRLSCAAS", 10);
-        assert!(
-            long.iter().all(|line| line.chars().count() <= 10),
-            "{long:?}"
-        );
-        assert_eq!(long.concat(), "QVQLVESGGGLVQAGGSLRLSCAAS");
-    }
-
-    #[test]
-    fn wrapping_keeps_each_line_s_own_indentation() {
-        // JSON in a reply is only readable if nesting survives the wrap.
-        let json = "{\n  \"regions\": [\n    {\"name\": \"cdr1\"}\n  ]\n}";
-        let lines = wrap(json, 40);
-        assert_eq!(lines[0], "{");
-        assert_eq!(lines[1], "  \"regions\": [");
-        assert_eq!(lines[2], "    {\"name\": \"cdr1\"}");
-        assert_eq!(lines[3], "  ]");
-        assert_eq!(lines[4], "}");
-
-        // A continuation of an indented line keeps the same indentation.
-        let long = "    aaa bbb ccc ddd eee fff ggg hhh";
-        let wrapped = wrap(long, 20);
-        assert!(wrapped.len() > 1, "{wrapped:?}");
-        assert!(
-            wrapped.iter().all(|line| line.starts_with("    ")),
-            "{wrapped:?}"
-        );
-        assert!(
-            wrapped.iter().all(|line| line.chars().count() <= 20),
-            "{wrapped:?}"
-        );
-    }
 
     #[tokio::test]
     async fn a_reply_cut_off_at_the_end_is_kept_and_still_checked() {
@@ -1883,88 +1413,6 @@ mod tests {
     }
 
     #[test]
-    fn the_input_line_edits_at_the_cursor() {
-        let mut input = TextInput::default();
-        for character in "hello".chars() {
-            input.insert(character);
-        }
-        assert_eq!(input.text(), "hello");
-        assert_eq!(input.cursor(), 5);
-
-        input.left();
-        input.left();
-        input.insert('X');
-        assert_eq!(input.text(), "helXlo");
-        assert_eq!(input.cursor(), 4);
-
-        input.home();
-        assert_eq!(input.cursor(), 0);
-        input.delete();
-        assert_eq!(input.text(), "elXlo");
-        input.end();
-        input.backspace();
-        assert_eq!(input.text(), "elXl");
-    }
-
-    #[test]
-    fn ctrl_w_deletes_one_word_including_its_spaces() {
-        let mut input = TextInput::default();
-        for character in "design the loops   ".chars() {
-            input.insert(character);
-        }
-        input.delete_word();
-        assert_eq!(input.text(), "design the ");
-        input.delete_word();
-        assert_eq!(input.text(), "design ");
-    }
-
-    #[test]
-    fn the_cursor_cannot_leave_the_line() {
-        let mut input = TextInput::default();
-        input.left();
-        input.backspace();
-        assert_eq!(input.cursor(), 0);
-        assert_eq!(input.text(), "");
-        input.insert('a');
-        input.right();
-        input.right();
-        assert_eq!(input.cursor(), 1);
-    }
-
-    #[test]
-    fn history_recalls_what_was_typed_and_comes_back() {
-        let mut input = TextInput::default();
-        input.set("first");
-        assert_eq!(input.take(), "first");
-        input.set("second");
-        assert_eq!(input.take(), "second");
-
-        input.set("draft");
-        input.recall_older();
-        assert_eq!(input.text(), "second");
-        input.recall_older();
-        assert_eq!(input.text(), "first");
-        input.recall_older();
-        assert_eq!(input.text(), "first", "stops at the oldest");
-        input.recall_newer();
-        assert_eq!(input.text(), "second");
-        input.recall_newer();
-        assert_eq!(input.text(), "draft", "returns to the unsent line");
-    }
-
-    #[test]
-    fn a_blank_line_is_not_remembered_and_duplicates_collapse() {
-        let mut input = TextInput::default();
-        input.set("   ");
-        input.take();
-        input.set("same");
-        input.take();
-        input.set("same");
-        input.take();
-        assert_eq!(input.history, vec!["same"]);
-    }
-
-    #[test]
     fn a_pasted_block_is_one_message_not_many() {
         // The bug this fixes: a multi-line paste used to read as a burst of
         // Enter presses, sending the first line and stranding the rest.
@@ -1978,48 +1426,6 @@ mod tests {
         assert!(app.history.is_empty(), "nothing should have been sent");
         assert!(app.waiting.is_none(), "no request should have started");
         assert!(app.status.contains("3 lines"), "{}", app.status);
-    }
-
-    #[test]
-    fn a_paste_keeps_its_shape_and_drops_only_a_trailing_newline() {
-        let mut input = TextInput::default();
-        input.insert_str("a\nb\n");
-        assert_eq!(input.text(), "a\nb");
-
-        // Carriage returns are dropped and tabs become spaces, so neither
-        // corrupts the layout.
-        let mut windows = TextInput::default();
-        windows.insert_str("one\r\ntwo\r\n");
-        assert_eq!(windows.text(), "one\ntwo");
-
-        let mut tabbed = TextInput::default();
-        tabbed.insert_str("a\tb");
-        assert_eq!(tabbed.text(), "a    b");
-    }
-
-    #[test]
-    fn the_cursor_walks_a_multi_line_message() {
-        let mut input = TextInput::default();
-        input.insert_str("alpha\nbe\ngamma");
-        assert_eq!(input.line_count(), 3);
-
-        input.home();
-        // Cursor is on the last line, at its start.
-        assert_eq!(input.row_col(), (2, 0));
-
-        input.up();
-        assert_eq!(input.row_col(), (1, 0));
-        input.end();
-        assert_eq!(input.row_col(), (1, 2), "end of the short middle line");
-
-        // Moving up from a short line clamps to the longer line's end.
-        input.up();
-        let (row, col) = input.row_col();
-        assert_eq!(row, 0);
-        assert!(col <= 5);
-
-        input.down();
-        assert_eq!(input.row_col().0, 1);
     }
 
     #[test]
@@ -2045,106 +1451,32 @@ mod tests {
     }
 
     #[test]
-    fn the_box_grows_with_the_message_and_stops_growing() {
-        let mut input = TextInput::default();
-        assert_eq!(input.line_count(), 1);
-        input.insert_str(&"x\n".repeat(20));
-        assert_eq!(input.line_count(), 20);
-
-        // The view shows a window of the lines, not all twenty.
-        let (lines, row, _) = input.view(40, 8);
-        assert_eq!(lines.len(), 8);
-        assert!(row < 8, "the cursor must stay on screen");
-    }
-
-    #[test]
-    fn the_visible_window_follows_the_cursor() {
-        let mut input = TextInput::default();
-        for character in "abcdefghijklmnop".chars() {
-            input.insert(character);
-        }
-        // At the end of a long line the tail is visible and the cursor sits
-        // just past it — the cursor takes a column of its own, so the text is
-        // at most width-1 characters.
-        let (lines, _, column) = input.view(8, 1);
-        let text = &lines[0];
-        assert!(text.chars().count() <= 8, "{text:?}");
-        assert!(text.ends_with('p'), "{text}");
-        assert!(column < 8, "cursor column {column} is off-pane");
-        assert_eq!(column, text.chars().count());
-
-        input.home();
-        let (lines, _, column) = input.view(8, 1);
-        assert!(lines[0].starts_with('a'), "{:?}", lines[0]);
-        assert_eq!(column, 0);
-
-        // Somewhere in the middle, the cursor is still on-pane.
-        for _ in 0..6 {
-            input.right();
-        }
-        let (lines, _, column) = input.view(8, 1);
-        assert!(column < 8, "cursor column {column} is off-pane");
-        assert!(!lines[0].is_empty());
-    }
-
-    #[test]
-    fn slash_commands_parse_with_aliases_and_arguments() {
-        assert_eq!(parse_slash("/help"), Some(Slash::Help));
-        assert_eq!(parse_slash("  /h  "), Some(Slash::Help));
-        assert_eq!(parse_slash("/run"), Some(Slash::Run));
-        assert_eq!(parse_slash("/save"), Some(Slash::Save(None)));
-        assert_eq!(
-            parse_slash("/save out/plan.yaml"),
-            Some(Slash::Save(Some("out/plan.yaml".to_string())))
-        );
-        assert_eq!(parse_slash("/QUIT"), Some(Slash::Quit));
-        assert_eq!(
-            parse_slash("/nope"),
-            Some(Slash::Unknown("nope".to_string()))
-        );
-        // Ordinary messages are not commands, including one that merely
-        // mentions a slash.
-        assert_eq!(parse_slash("design the loops"), None);
-        assert_eq!(parse_slash("use a 50/50 split"), None);
-    }
-
-    #[test]
     fn typing_a_slash_offers_every_command_and_narrows_as_you_type() {
-        assert_eq!(suggestions("/").len(), COMMANDS.len());
-        let narrowed = suggestions("/r");
+        assert_eq!(command::suggestions("/").len(), COMMANDS.len());
+        let narrowed = command::suggestions("/r");
         let names: Vec<&str> = narrowed.iter().map(|(name, _, _)| *name).collect();
         assert_eq!(names, vec!["/retry", "/run"]);
 
         assert_eq!(
-            suggestions("/PRO")
+            command::suggestions("/PRO")
                 .iter()
                 .map(|(n, _, _)| *n)
                 .collect::<Vec<_>>(),
             vec!["/provider"],
             "matching ignores case"
         );
-        assert!(suggestions("/nope").is_empty());
+        assert!(command::suggestions("/nope").is_empty());
     }
 
     #[test]
     fn the_list_closes_once_a_command_is_chosen_or_the_text_is_not_one() {
         // An argument having been started means the command is settled.
-        assert!(suggestions("/save out.yaml").is_empty());
-        assert!(suggestions("/model ").is_empty());
+        assert!(command::suggestions("/save out.yaml").is_empty());
+        assert!(command::suggestions("/model ").is_empty());
         // Ordinary messages never open it, including one that mentions a slash.
-        assert!(suggestions("design the loops").is_empty());
-        assert!(suggestions("use a 50/50 split").is_empty());
-        assert!(suggestions("").is_empty());
-    }
-
-    #[test]
-    fn the_help_text_is_generated_from_the_same_table() {
-        let help = help_text();
-        for (name, _, what) in COMMANDS {
-            assert!(help.contains(name), "{name} missing from the help");
-            assert!(help.contains(what), "{what:?} missing from the help");
-        }
-        assert!(help.contains("Tab completes a command"));
+        assert!(command::suggestions("design the loops").is_empty());
+        assert!(command::suggestions("use a 50/50 split").is_empty());
+        assert!(command::suggestions("").is_empty());
     }
 
     #[tokio::test]
@@ -2373,17 +1705,17 @@ mod tests {
     #[tokio::test]
     async fn provider_commands_parse() {
         assert_eq!(
-            parse_slash("/model claude-opus-4-7"),
+            command::parse_slash("/model claude-opus-4-7"),
             Some(Slash::SetModel("claude-opus-4-7".to_string()))
         );
         assert_eq!(
-            parse_slash("/url https://gateway.example.com"),
+            command::parse_slash("/url https://gateway.example.com"),
             Some(Slash::SetUrl("https://gateway.example.com".to_string()))
         );
         // Bare forms ask rather than set.
-        assert_eq!(parse_slash("/model"), Some(Slash::Model));
-        assert_eq!(parse_slash("/url"), Some(Slash::Provider));
-        assert_eq!(parse_slash("/provider"), Some(Slash::Provider));
+        assert_eq!(command::parse_slash("/model"), Some(Slash::Model));
+        assert_eq!(command::parse_slash("/url"), Some(Slash::Provider));
+        assert_eq!(command::parse_slash("/provider"), Some(Slash::Provider));
     }
 
     #[tokio::test]
