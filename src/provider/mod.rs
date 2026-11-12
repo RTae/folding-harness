@@ -20,6 +20,7 @@
 
 pub mod anthropic;
 pub mod openai;
+pub mod sse;
 
 use std::sync::Arc;
 
@@ -203,6 +204,41 @@ pub fn build(settings: &ProviderSettings) -> Result<Arc<dyn ModelProvider>, Agen
     })
 }
 
+/// One line naming the model and host, flagging a host that is not the
+/// vendor's own.
+///
+/// Both wires need the same sentence, and a caller deciding whether prompts
+/// are leaving the first-party API should not depend on which wire it is.
+pub fn describe_endpoint(model: &str, base_url: &str, first_party: bool, note: &str) -> String {
+    let host = host_of(base_url);
+    if first_party {
+        format!("{model} via {host}")
+    } else {
+        format!("{model} via {host} — a third-party endpoint: prompts go to that host{note}")
+    }
+}
+
+/// An HTTP failure, with a hint about the likely cause.
+///
+/// The hints matter most on a custom endpoint, where a 404 is far more likely
+/// to be a wrong URL than a wrong request.
+pub fn status_error(host: &str, status: u16, body: &str, first_party: bool) -> AgentError {
+    let hint = match status {
+        401 | 403 => " — check the key for this endpoint",
+        404 => " — check the base URL, and that this endpoint serves this model",
+        400 if !first_party => {
+            " — the endpoint rejected the request; check the model name, and try --api-version"
+        }
+        400 => " — the endpoint rejected the request; check the model name",
+        429 => " — rate limited",
+        _ => "",
+    };
+    AgentError::Provider(format!(
+        "{host} returned HTTP {status}{hint}: {}",
+        body.chars().take(400).collect::<String>()
+    ))
+}
+
 /// Host part of a URL, for printing.
 pub fn host_of(url: &str) -> &str {
     url.split("://")
@@ -283,6 +319,51 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("FH_TEST_ABSENT_KEY"), "{message}");
         assert!(message.contains("--key-command"), "{message}");
+    }
+
+    #[test]
+    fn build_honours_the_profile_s_wire() {
+        // Building by hand per wire is how a caller ends up pointing an
+        // Anthropic client at an OpenAI endpoint, so one function decides.
+        let openai = ProviderSettings {
+            wire: Some(Wire::Openai),
+            key_command: Some("echo token".to_string()),
+            model: Some("gpt-4o".to_string()),
+            ..Default::default()
+        };
+        let built = build(&openai).expect("builds");
+        assert_eq!(built.model(), "gpt-4o");
+        assert_eq!(built.endpoint(), "api.openai.com");
+
+        let anthropic = ProviderSettings {
+            wire: Some(Wire::Anthropic),
+            key_command: Some("echo sk-ant-token".to_string()),
+            model: Some("claude-opus-5-5".to_string()),
+            ..Default::default()
+        };
+        let built = build(&anthropic).expect("builds");
+        assert_eq!(built.endpoint(), "api.anthropic.com");
+
+        // No wire named means the Anthropic default.
+        let bare = ProviderSettings {
+            key_command: Some("echo token".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build(&bare).expect("builds").endpoint(),
+            "api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn a_wire_reaches_the_endpoint_the_profile_names() {
+        let settings = ProviderSettings {
+            wire: Some(Wire::Openai),
+            url: Some("https://gw.test".to_string()),
+            key_command: Some("echo token".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(build(&settings).expect("builds").endpoint(), "gw.test");
     }
 
     #[test]

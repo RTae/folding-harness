@@ -71,15 +71,7 @@ impl OpenAiProvider {
     }
 
     pub fn describe(&self) -> String {
-        if self.is_first_party() {
-            format!("{} via {}", self.model, self.host())
-        } else {
-            format!(
-                "{} via {} — a third-party endpoint: prompts go to that host",
-                self.model,
-                self.host()
-            )
-        }
+        super::describe_endpoint(&self.model, &self.base_url, self.is_first_party(), "")
     }
 
     pub fn request_body(&self, system: &str, messages: &[ChatMessage]) -> Value {
@@ -102,18 +94,7 @@ impl OpenAiProvider {
     }
 
     fn status_error(&self, status: u16, body: &str) -> AgentError {
-        let hint = match status {
-            401 | 403 => " — check the key for this endpoint",
-            404 => " — check the base URL, and that this endpoint serves this model",
-            400 => " — the endpoint rejected the request; check the model name",
-            429 => " — rate limited",
-            _ => "",
-        };
-        AgentError::Provider(format!(
-            "{} returned HTTP {status}{hint}: {}",
-            self.host(),
-            body.chars().take(400).collect::<String>()
-        ))
+        super::status_error(self.host(), status, body, self.is_first_party())
     }
 }
 
@@ -243,8 +224,6 @@ impl ModelProvider for OpenAiProvider {
         messages: &[ChatMessage],
         deltas: std::sync::mpsc::Sender<String>,
     ) -> Result<String, AgentError> {
-        use futures_util::StreamExt;
-
         if messages.is_empty() {
             return Err(AgentError::Provider("no messages to send".to_string()));
         }
@@ -275,59 +254,38 @@ impl ModelProvider for OpenAiProvider {
             return Err(self.status_error(status.as_u16(), &text));
         }
 
-        let mut stream = response.bytes_stream();
-        // Bytes, not text: a multi-byte character can straddle two chunks.
-        let mut buffer: Vec<u8> = Vec::new();
         let mut text = String::new();
         let mut finish: Option<String> = None;
         let mut input_tokens: Option<u64> = None;
         let mut output_tokens: Option<u64> = None;
+        let mut refusal: Option<String> = None;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| {
-                AgentError::Provider(format!("stream from {} broke: {error}", self.host()))
-            })?;
-            buffer.extend_from_slice(&chunk);
+        super::sse::read_events(response, self.host(), |value| {
+            let (input, output) = crate::usage::tokens_from_body(value);
+            input_tokens = input.or(input_tokens);
+            output_tokens = output.or(output_tokens);
 
-            while let Some(at) = buffer.windows(2).position(|pair| pair == b"\n\n") {
-                let event: Vec<u8> = buffer.drain(..at + 2).collect();
-                let event = String::from_utf8_lossy(&event);
-
-                for line in event.lines() {
-                    let Some(data) = line.strip_prefix("data:") else {
-                        continue;
-                    };
-                    let data = data.trim();
-                    if data.is_empty() || data == "[DONE]" {
-                        continue;
-                    }
-                    let Ok(value) = serde_json::from_str::<Value>(data) else {
-                        continue;
-                    };
-                    let (input, output) = crate::usage::tokens_from_body(&value);
-                    input_tokens = input.or(input_tokens);
-                    output_tokens = output.or(output_tokens);
-
-                    let choice = &value["choices"][0];
-                    if let Some(piece) = choice["delta"]["content"].as_str() {
-                        if !piece.is_empty() {
-                            text.push_str(piece);
-                            let _ = deltas.send(piece.to_string());
-                        }
-                    }
-                    if let Some(refusal) = choice["delta"]["refusal"].as_str() {
-                        if !refusal.trim().is_empty() {
-                            return Err(AgentError::Provider(format!(
-                                "the model declined this request: {refusal}"
-                            )));
-                        }
-                    }
-                    if let Some(reason) = choice["finish_reason"].as_str() {
-                        finish = Some(reason.to_string());
-                    }
+            let choice = &value["choices"][0];
+            if let Some(piece) = choice["delta"]["content"].as_str() {
+                if !piece.is_empty() {
+                    text.push_str(piece);
+                    let _ = deltas.send(piece.to_string());
                 }
             }
-        }
+            if let Some(declined) = choice["delta"]["refusal"].as_str() {
+                if !declined.trim().is_empty() {
+                    refusal = Some(declined.to_string());
+                    return super::sse::Step::Fail(AgentError::Provider(format!(
+                        "the model declined this request: {declined}"
+                    )));
+                }
+            }
+            if let Some(reason) = choice["finish_reason"].as_str() {
+                finish = Some(reason.to_string());
+            }
+            super::sse::Step::Continue
+        })
+        .await?;
 
         self.meter.record_call(input_tokens, output_tokens);
 

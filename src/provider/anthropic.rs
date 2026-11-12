@@ -216,31 +216,20 @@ impl Provider {
         self.base_url == DEFAULT_BASE_URL
     }
 
-    /// Host part of the endpoint, for printing. Falls back to the whole URL if
-    /// it cannot be split.
+    /// Host part of the endpoint, for printing.
     pub fn host(&self) -> &str {
-        self.base_url
-            .split("://")
-            .nth(1)
-            .unwrap_or(&self.base_url)
-            .split('/')
-            .next()
-            .unwrap_or(&self.base_url)
+        super::host_of(&self.base_url)
     }
 
     /// One line naming the model, the host, and whether prompts are leaving
     /// Anthropic's API. Printed by the CLI before any prompt is sent.
     pub fn describe(&self) -> String {
-        if self.is_first_party() {
-            format!("{} via {}", self.model, self.host())
-        } else {
-            format!(
-                "{} via {} — a third-party endpoint: prompts go to that host, and \
-                 Anthropic-specific request fields are omitted",
-                self.model,
-                self.host()
-            )
-        }
+        super::describe_endpoint(
+            &self.model,
+            &self.base_url,
+            self.is_first_party(),
+            ", and Anthropic-specific request fields are omitted",
+        )
     }
 
     /// The request body. Separate from sending so it can be asserted on.
@@ -285,23 +274,8 @@ impl Provider {
         builder
     }
 
-    /// The hints matter most on a custom endpoint, where a 404 is far more
-    /// likely to be a wrong URL than a wrong request.
     fn status_error(&self, status: u16, body: &str) -> AgentError {
-        let hint = match status {
-            401 | 403 => " — check the API key for this endpoint",
-            404 => " — check the base URL, and that this endpoint serves this model",
-            400 if !self.is_first_party() => {
-                " — the endpoint rejected the request; try --api-version, or a model it serves"
-            }
-            429 => " — rate limited",
-            _ => "",
-        };
-        AgentError::Provider(format!(
-            "{} returned HTTP {status}{hint}: {}",
-            self.host(),
-            body.chars().take(400).collect::<String>()
-        ))
+        super::status_error(self.host(), status, body, self.is_first_party())
     }
 
     fn beta_headers(&self) -> Vec<&str> {
@@ -423,8 +397,6 @@ impl ModelProvider for Provider {
         messages: &[ChatMessage],
         deltas: std::sync::mpsc::Sender<String>,
     ) -> Result<String, AgentError> {
-        use futures_util::StreamExt;
-
         if messages.is_empty() {
             return Err(AgentError::Provider("no messages to send".to_string()));
         }
@@ -454,77 +426,51 @@ impl ModelProvider for Provider {
             return Err(self.status_error(status.as_u16(), &text));
         }
 
-        let mut stream = response.bytes_stream();
-        // Bytes, not a String: a multi-byte character can straddle two chunks,
-        // and decoding a partial chunk would corrupt it.
-        let mut buffer: Vec<u8> = Vec::new();
+        // Anthropic reports usage across two events: the input count on
+        // `message_start`, the output count on `message_delta`.
         let mut text = String::new();
         let mut stop_reason: Option<String> = None;
         let mut refusal: Option<String> = None;
         let mut input_tokens: Option<u64> = None;
         let mut output_tokens: Option<u64> = None;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| {
-                AgentError::Provider(format!("stream from {} broke: {error}", self.host()))
-            })?;
-            buffer.extend_from_slice(&chunk);
-
-            while let Some(at) = buffer.windows(2).position(|pair| pair == b"\n\n") {
-                let event: Vec<u8> = buffer.drain(..at + 2).collect();
-                let event = String::from_utf8_lossy(&event);
-
-                for line in event.lines() {
-                    let Some(data) = line.strip_prefix("data:") else {
-                        continue;
-                    };
-                    let data = data.trim();
-                    if data.is_empty() || data == "[DONE]" {
-                        continue;
-                    }
-                    let Ok(value) = serde_json::from_str::<Value>(data) else {
-                        continue;
-                    };
-
-                    match value.get("type").and_then(Value::as_str) {
-                        Some("content_block_delta") => {
-                            if value["delta"]["type"] == "text_delta" {
-                                if let Some(piece) = value["delta"]["text"].as_str() {
-                                    text.push_str(piece);
-                                    let _ = deltas.send(piece.to_string());
-                                }
-                            }
+        super::sse::read_events(response, self.host(), |value| {
+            match value.get("type").and_then(serde_json::Value::as_str) {
+                Some("content_block_delta") => {
+                    if value["delta"]["type"] == "text_delta" {
+                        if let Some(piece) = value["delta"]["text"].as_str() {
+                            text.push_str(piece);
+                            let _ = deltas.send(piece.to_string());
                         }
-                        Some("message_start") => {
-                            if let Some(tokens) = value["message"]["usage"]["input_tokens"].as_u64()
-                            {
-                                input_tokens = Some(tokens);
-                            }
-                        }
-                        Some("message_delta") => {
-                            if let Some(tokens) = value["usage"]["output_tokens"].as_u64() {
-                                output_tokens = Some(tokens);
-                            }
-                            if let Some(reason) = value["delta"]["stop_reason"].as_str() {
-                                stop_reason = Some(reason.to_string());
-                            }
-                            if let Some(category) =
-                                value["delta"]["stop_details"]["category"].as_str()
-                            {
-                                refusal = Some(category.to_string());
-                            }
-                        }
-                        Some("error") => {
-                            let detail = value["error"]["message"]
-                                .as_str()
-                                .unwrap_or("the stream reported an error");
-                            return Err(AgentError::Provider(detail.to_string()));
-                        }
-                        _ => {}
                     }
                 }
+                Some("message_start") => {
+                    if let Some(tokens) = value["message"]["usage"]["input_tokens"].as_u64() {
+                        input_tokens = Some(tokens);
+                    }
+                }
+                Some("message_delta") => {
+                    if let Some(tokens) = value["usage"]["output_tokens"].as_u64() {
+                        output_tokens = Some(tokens);
+                    }
+                    if let Some(reason) = value["delta"]["stop_reason"].as_str() {
+                        stop_reason = Some(reason.to_string());
+                    }
+                    if let Some(category) = value["delta"]["stop_details"]["category"].as_str() {
+                        refusal = Some(category.to_string());
+                    }
+                }
+                Some("error") => {
+                    let detail = value["error"]["message"]
+                        .as_str()
+                        .unwrap_or("the stream reported an error");
+                    return super::sse::Step::Fail(AgentError::Provider(detail.to_string()));
+                }
+                _ => {}
             }
-        }
+            super::sse::Step::Continue
+        })
+        .await?;
 
         self.meter.record_call(input_tokens, output_tokens);
 
