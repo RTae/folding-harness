@@ -147,6 +147,12 @@ pub struct FixedResidue {
     pub position: usize,
 }
 
+/// Structural faults in a scaffold.
+///
+/// The variants a task YAML can cause name the chain by its `label`, the
+/// string the user wrote, beside the internal `chain` id, so the rendered
+/// message names something the user can find in their own file. The id stays
+/// available for callers that match on it.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ScaffoldError {
     #[error("scaffold has no chains")]
@@ -167,12 +173,17 @@ pub enum ScaffoldError {
     },
     #[error("scaffold has no target chain")]
     NoTarget,
-    #[error("region '{name}' references {chain}, which is not a binder chain")]
-    RegionNotOnBinder { name: String, chain: ChainId },
-    #[error("region '{name}' spans {start}..{end} but {chain} has length {len}")]
+    #[error("region '{name}' references chain '{label}', which is not a binder chain")]
+    RegionNotOnBinder {
+        name: String,
+        chain: ChainId,
+        label: String,
+    },
+    #[error("region '{name}' spans {start}..{end} but chain '{label}' has length {len}")]
     RegionOutOfBounds {
         name: String,
         chain: ChainId,
+        label: String,
         start: usize,
         end: usize,
         len: usize,
@@ -183,9 +194,10 @@ pub enum ScaffoldError {
     OverlappingRegions { a: String, b: String },
     #[error("duplicate region name '{name}'")]
     DuplicateRegionName { name: String },
-    #[error("fixed residue {chain}:{position} is outside that chain (length {len})")]
+    #[error("fixed residue {label}:{position} is outside that chain (length {len})")]
     FixedOutOfBounds {
         chain: ChainId,
+        label: String,
         position: usize,
         len: usize,
     },
@@ -220,6 +232,16 @@ impl Scaffold {
 
     pub fn target_chains(&self) -> impl Iterator<Item = &Chain> {
         self.chains.iter().filter(|c| c.role == ChainRole::Target)
+    }
+
+    /// The name an error message gives a chain: its label, which is what a
+    /// task YAML writes. The id fallback only serves a hand-built scaffold
+    /// whose region or pin references a chain id that does not exist, which
+    /// [`crate::config::TaskConfig::to_scaffold`] rejects before validating.
+    fn chain_label(&self, id: ChainId) -> String {
+        self.chain(id)
+            .map(|c| c.label.clone())
+            .unwrap_or_else(|| id.to_string())
     }
 
     pub fn validate(&self) -> Result<(), ScaffoldError> {
@@ -277,6 +299,7 @@ impl Scaffold {
                 .ok_or_else(|| ScaffoldError::RegionNotOnBinder {
                     name: region.name.clone(),
                     chain: region.chain,
+                    label: self.chain_label(region.chain),
                 })?;
             if region.is_empty() {
                 return Err(ScaffoldError::EmptyRegion {
@@ -287,6 +310,7 @@ impl Scaffold {
                 return Err(ScaffoldError::RegionOutOfBounds {
                     name: region.name.clone(),
                     chain: region.chain,
+                    label: chain.label.clone(),
                     start: region.start,
                     end: region.end,
                     len: chain.len(),
@@ -310,6 +334,7 @@ impl Scaffold {
             if fixed.position >= len {
                 return Err(ScaffoldError::FixedOutOfBounds {
                     chain: fixed.chain,
+                    label: self.chain_label(fixed.chain),
                     position: fixed.position,
                     len,
                 });
@@ -533,6 +558,89 @@ impl BinderSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TaskConfig;
+
+    const VHH_YAML: &str = r#"
+name: label-demo
+binder:
+  topology: vhh
+  chains:
+    - label: H
+      sequence: ACDEFGHIKLMNPQRSTVWY
+  regions:
+    - name: loop1
+      chain: H
+      start: 5
+      end: 8
+  fixed_residues: ["H:10"]
+target:
+  chains:
+    - label: A
+      sequence: ACDEFGHIKLMNPQRSTVWY
+design:
+  cycles: 1
+  batch_size: 1
+"#;
+
+    const PAIRED_YAML: &str = r#"
+name: paired-label-demo
+binder:
+  topology: paired_chains
+  chains:
+    - label: H
+      sequence: ACDEFGHIKLMNPQRSTVWY
+    - label: L
+      sequence: ACDEFGHIKLMNPQRSTVWY
+  regions:
+    - name: loopL
+      chain: L
+      start: 5
+      end: 25
+target:
+  chains:
+    - label: A
+      sequence: ACDEFGHIKLMNPQRSTVWY
+design:
+  cycles: 1
+  batch_size: 1
+"#;
+
+    fn scaffold_error(yaml: &str) -> String {
+        let config = TaskConfig::from_yaml(yaml).expect("fixture parses");
+        config
+            .to_scaffold()
+            .expect_err("fixture must fail")
+            .to_string()
+    }
+
+    #[test]
+    fn a_region_past_its_chain_names_the_label_the_yaml_used() {
+        let msg = scaffold_error(&VHH_YAML.replace("end: 8", "end: 25"));
+        assert!(msg.contains("chain 'H'"), "got: {msg}");
+        assert!(!msg.contains("chain0"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_pinned_residue_past_its_chain_names_the_label_the_yaml_used() {
+        let msg = scaffold_error(&VHH_YAML.replace("H:10", "H:25"));
+        assert!(msg.contains("fixed residue H:"), "got: {msg}");
+        assert!(!msg.contains("chain0"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_region_on_a_target_chain_names_that_chains_label() {
+        let msg = scaffold_error(&VHH_YAML.replace("chain: H", "chain: A"));
+        assert!(msg.contains("chain 'A'"), "got: {msg}");
+        assert!(!msg.contains("chain1"), "got: {msg}");
+    }
+
+    #[test]
+    fn with_two_binder_chains_the_error_names_the_one_that_rejected_the_region() {
+        let msg = scaffold_error(PAIRED_YAML);
+        assert!(msg.contains("chain 'L'"), "got: {msg}");
+        assert!(!msg.contains("'H'"), "got: {msg}");
+        assert!(!msg.contains("chain1"), "got: {msg}");
+    }
 
     fn region(start: usize, end: usize) -> Region {
         Region {
