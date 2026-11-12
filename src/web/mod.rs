@@ -557,6 +557,111 @@ mod tests {
         assert_eq!(rows.len(), 1, "expected only 1700-demo, got {body}");
         assert_eq!(rows[0]["id"], "1700-demo");
         assert_eq!(rows[0]["name"], "demo");
+        // `write_manifest` leaves `finished_at_ms` unset, so this pins the
+        // negative half. Without it a handler hardcoded to `finished: true`
+        // would pass, and the founder-only test would be the only guard.
+        assert_eq!(
+            rows[0]["finished"], false,
+            "an unfinished run must not be listed as finished"
+        );
+    }
+
+    /// The config for a real founder-only run. Small, because the arm folds
+    /// the founder once and never asks the agent or the router anything.
+    const FOUNDER_YAML: &str = r#"
+name: founder-web
+binder:
+  topology: vhh
+  chains:
+    - label: H
+      sequence: QVQLVESGGGLVQAGGSLRLSCAASGYTFTSYAMGWFRQAPGKEREFVAAISWSGGSTYYADSVKGRFTISRDNAKNTVYLQMNSLKPEDTAVYYCAAGSYYDYWGQGTQVTVSS
+  regions:
+    - name: loop1
+      chain: H
+      start: 26
+      end: 33
+target:
+  chains:
+    - label: A
+      sequence: MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQ
+design:
+  cycles: 1
+  batch_size: 2
+  seed: 21
+gates:
+  min_iptm: 0.2
+  min_interface_plddt: 40.0
+  max_pae_interface: 30.0
+  max_clashes: 2
+  min_interface_contacts: 5
+  max_hydrophobic_patch: 0.9
+fold:
+  model: fixture
+  execution_mode: fixture
+"#;
+
+    /// The run picker reads "finished" from the manifest's `finished_at_ms`.
+    /// A founder-only run, the floor arm `fh bench` writes, must be listed as
+    /// finished once it completes. The task directory here comes from a real
+    /// orchestrator run, not a hand-written manifest, so the test fails if the
+    /// arm ever stops closing its manifest again.
+    #[tokio::test]
+    async fn a_completed_founder_only_run_is_listed_as_finished() {
+        use crate::agent::HeuristicAgent;
+        use crate::fold::FixtureBackend;
+        use crate::orchestrator::Orchestrator;
+        use crate::{TaskConfig, TaskId};
+
+        let root = TempRoot::new("founder-finished");
+        let config = TaskConfig::from_yaml(FOUNDER_YAML).expect("config parses");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+        let backend = std::sync::Arc::new(FixtureBackend::planted(
+            &scaffold,
+            &scope,
+            config.design.seed,
+        ));
+        let mut orchestrator = Orchestrator::prepare(
+            config,
+            backend,
+            Box::new(HeuristicAgent::new(21)),
+            TaskPaths::new(root.path.join("1700-demo")),
+            TaskId("founder".to_string()),
+        )
+        .await
+        .expect("prepares");
+        let summary = orchestrator.seed_founder_only().await.expect("completes");
+        let founder_loss = summary
+            .best
+            .as_ref()
+            .and_then(|candidate| candidate.loss)
+            .expect("the founder is scored");
+
+        let listener = bind_loopback(0).await.expect("bind");
+        let addr = listener.local_addr().expect("bound address");
+        let served = root.path.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app(served)).await;
+        });
+
+        let body: serde_json::Value = reqwest::get(format!("http://{addr}/api/runs"))
+            .await
+            .expect("request the runs list")
+            .json()
+            .await
+            .expect("read the runs list");
+        let rows = body.as_array().expect("the runs list is an array");
+        assert_eq!(rows.len(), 1, "expected only 1700-demo, got {body}");
+        assert_eq!(rows[0]["id"], "1700-demo");
+        assert_eq!(
+            rows[0]["finished"], true,
+            "a completed founder-only run must not be listed as still running"
+        );
+        assert_eq!(rows[0]["cycles_completed"], 0);
+        assert_eq!(
+            rows[0]["best_loss"].as_f64(),
+            Some(founder_loss),
+            "the picker must show the founder's loss"
+        );
     }
 
     #[tokio::test]

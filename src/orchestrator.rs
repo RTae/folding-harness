@@ -469,6 +469,40 @@ impl Orchestrator {
         CandidateId(self.next_id)
     }
 
+    /// The completion step both arms share: emit `TaskFinished`, mark the run
+    /// finished in the manifest, name the best candidate the population
+    /// holds, persist the counters through [`Self::record_progress`], and
+    /// write the final snapshot with `running` cleared.
+    ///
+    /// `cycles_completed` is what the event and the snapshot report: `run`
+    /// passes the manifest's count, the founder-only arm passes zero.
+    /// Returns the best candidate and the elapsed time for the caller's
+    /// [`RunSummary`].
+    fn finish(
+        &mut self,
+        cycles_completed: u32,
+        started: Instant,
+    ) -> Result<(Option<Candidate>, u64), RunError> {
+        let best = self.population.best().cloned();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        self.emit(Event::TaskFinished {
+            cycles_completed,
+            folds: self.folds,
+            best: best.as_ref().map(|candidate| candidate.id),
+            best_loss: best.as_ref().and_then(|candidate| candidate.loss),
+            elapsed_ms,
+        })?;
+
+        self.manifest.finished_at_ms = Some(now_ms());
+        self.manifest.best_candidate = best.as_ref().map(|candidate| candidate.id);
+        self.manifest.best_loss = best.as_ref().and_then(|candidate| candidate.loss);
+        self.record_progress()?;
+        self.snapshot(cycles_completed, false)?;
+
+        Ok((best, elapsed_ms))
+    }
+
     /// Fold the input sequence and stop, without searching.
     ///
     /// The control arm of a benchmark: it shows what the starting sequence
@@ -478,20 +512,11 @@ impl Orchestrator {
         self.announce()?;
         self.seed_founder().await?;
 
-        let best = self.population.best().cloned();
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        self.emit(Event::TaskFinished {
-            cycles_completed: 0,
-            folds: self.folds,
-            best: best.as_ref().map(|candidate| candidate.id),
-            best_loss: best.as_ref().and_then(|candidate| candidate.loss),
-            elapsed_ms,
-        })?;
-        // The arm persists the same counters `run` does, through the same
-        // assembly. Without this, run.json keeps the empty usage `prepare`
-        // wrote and the founder fold never reaches a later resume.
-        self.record_progress()?;
-        self.snapshot(0, false)?;
+        // The arm closes its manifest through the same completion step `run`
+        // uses, so a benchmark's floor arm leaves a task directory that reads
+        // as finished rather than one `fh ls` and the web view report as
+        // still running forever.
+        let (best, elapsed_ms) = self.finish(0, started)?;
 
         Ok(RunSummary {
             task_id: self.task_id.clone(),
@@ -566,22 +591,7 @@ impl Orchestrator {
             self.snapshot(cycle, true)?;
         }
 
-        let best = self.population.best().cloned();
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-
-        self.emit(Event::TaskFinished {
-            cycles_completed: self.manifest.cycles_completed,
-            folds: self.folds,
-            best: best.as_ref().map(|candidate| candidate.id),
-            best_loss: best.as_ref().and_then(|candidate| candidate.loss),
-            elapsed_ms,
-        })?;
-
-        self.manifest.finished_at_ms = Some(now_ms());
-        self.manifest.best_candidate = best.as_ref().map(|candidate| candidate.id);
-        self.manifest.best_loss = best.as_ref().and_then(|candidate| candidate.loss);
-        self.record_progress()?;
-        self.snapshot(self.manifest.cycles_completed, false)?;
+        let (best, elapsed_ms) = self.finish(self.manifest.cycles_completed, started)?;
 
         Ok(RunSummary {
             task_id: self.task_id.clone(),
@@ -2034,6 +2044,66 @@ fold:
         assert_eq!(manifest.usage.calls, spent.calls);
         assert_eq!(manifest.usage.input_tokens, spent.input_tokens);
         assert_eq!(manifest.usage.output_tokens, spent.output_tokens);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The founder-only arm closes its manifest the way `run` closes one: the
+    /// task directory reads as finished, and the best it names is the founder
+    /// the population actually holds. Without this, `fh ls` and the web view
+    /// report every completed benchmark floor as still running, forever.
+    #[tokio::test]
+    async fn the_founder_only_arm_leaves_a_manifest_that_reads_as_finished() {
+        let dir = temp_dir("founder-only-manifest");
+        let config = TaskConfig::from_yaml(YAML).expect("config parses");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 21));
+        let mut orchestrator = Orchestrator::prepare(
+            config,
+            backend,
+            Box::new(HeuristicAgent::new(21)),
+            crate::trace::TaskPaths::new(&dir),
+            TaskId("founder-only".to_string()),
+        )
+        .await
+        .expect("prepares");
+
+        let summary = orchestrator.seed_founder_only().await.expect("completes");
+        let founder = orchestrator
+            .population()
+            .best()
+            .cloned()
+            .expect("the founder is admitted");
+        let founder_loss = founder.loss.expect("the founder is scored");
+
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let manifest: RunManifest =
+            crate::trace::read_json(paths.manifest()).expect("manifest reads");
+        assert!(
+            manifest.finished_at_ms.is_some(),
+            "the arm never marked the run finished"
+        );
+        assert_eq!(manifest.cycles_completed, 0);
+        assert_eq!(manifest.best_candidate, Some(founder.id));
+        // The loss the population holds, not a literal a fixture change
+        // would silently invalidate.
+        assert_eq!(manifest.best_loss, Some(founder_loss));
+        // The counters `record_progress` persists survive the completion step.
+        assert_eq!(manifest.folds, 1);
+        assert_eq!(manifest.usage.folds, 1);
+
+        let snapshot: crate::trace::PopulationSnapshot =
+            crate::trace::read_json(paths.population()).expect("population reads");
+        assert!(!snapshot.running);
+        assert_eq!(snapshot.cycle, 0);
+        assert_eq!(snapshot.members.len(), 1);
+        assert_eq!(snapshot.members[0].loss, Some(founder_loss));
+
+        // What `fh bench` reads from the summary does not move.
+        assert_eq!(summary.cycles_completed, 0);
+        assert_eq!(summary.folds, 1);
+        assert_eq!(summary.best.as_ref().map(|c| c.id), Some(founder.id));
 
         std::fs::remove_dir_all(&dir).ok();
     }
