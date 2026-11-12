@@ -60,8 +60,10 @@ than by a rule someone has to remember. Concretely:
   `src/scaffold.rs`. `BinderSequence::replace` is `pub(crate)` on purpose.
 - Do not let a skill assemble a `Candidate` directly and bypass `propose`.
 - Residue positions are **one-based inclusive in YAML** and **zero-based
-  half-open everywhere else**. The single conversion is in
-  `TaskConfig::to_scaffold`.
+  half-open everywhere else**. The single inbound conversion is in
+  `TaskConfig::to_scaffold`. The single outbound one, which exists only for
+  display, is in `Region::display_span`. No other code adds one to a stored
+  start.
 
 Three places cover this: `src/tests.rs`, `src/skills/mod.rs`, and the
 end-to-end check `no_run_ever_changes_a_position_outside_the_mutable_scope` in
