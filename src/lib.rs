@@ -63,8 +63,8 @@ pub use metrics::{loss, loss_breakdown, LossBreakdown, LossTerm, LossWeights, Me
 pub use population::{AdmissionOutcome, Population, PopulationConfig, PopulationStats};
 pub use proposal::{Capability, Proposal, ProposalError, SkillId, Substitution};
 pub use scaffold::{
-    is_standard_aa, BinderSequence, BinderTopology, Chain, ChainRole, FixedResidue, MutableScope,
-    Region, RegionSpan, Scaffold, ScaffoldError, AMINO_ACIDS,
+    is_standard_aa, BinderSequence, BinderTopology, Chain, ChainRole, DisplayPosition,
+    FixedResidue, MutableScope, Region, RegionSpan, Scaffold, ScaffoldError, AMINO_ACIDS,
 };
 pub use search::{CycleOutcome, CycleRecord, SearchHistory, SearchState, SkillStats};
 

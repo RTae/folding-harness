@@ -61,14 +61,17 @@ than by a rule someone has to remember. Concretely:
 - Do not let a skill assemble a `Candidate` directly and bypass `propose`.
 - Residue positions are **one-based inclusive in YAML** and **zero-based
   half-open everywhere else**. The single inbound conversion is in
-  `TaskConfig::to_scaffold`. The single outbound one, which exists only for
-  display, is in `Region::display_span`. No other code adds one to a stored
-  start.
+  `TaskConfig::to_scaffold`. The outbound conversions, which exist only for
+  display, are `Region::display_span` and `FixedResidue::display_position`. No
+  other code keeps a value computed by adding one to a stored position or a
+  stored region start. Adding one inside a `format!` and rendering the result
+  is fine, and several places do it. Storing the incremented number in a field
+  is not, because a reader then cannot tell it from the stored form.
 
-Three places cover this: `src/tests.rs`, `src/skills/mod.rs`, and the
-end-to-end check `no_run_ever_changes_a_position_outside_the_mutable_scope` in
-`src/orchestrator.rs`. A change that makes those pass by weakening an assertion
-is not a fix.
+This is covered by `src/tests.rs`, `src/skills/mod.rs`, the end-to-end check
+`no_run_ever_changes_a_position_outside_the_mutable_scope` in
+`src/orchestrator.rs`, and the display conversion tests in `src/scaffold.rs`. A
+change that makes those pass by weakening an assertion is not a fix.
 
 ## Layering
 
