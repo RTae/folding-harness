@@ -282,6 +282,133 @@ fn population_rejects_duplicates_and_evicts_the_worst() {
 }
 
 #[test]
+fn a_restored_population_still_refuses_the_duplicates_it_recorded() {
+    let (scaffold, scope) = config().resolve().expect("resolves");
+    let founder = BinderSequence::from_scaffold(&scaffold);
+    let chain = ChainId(0);
+    let variant = scope
+        .propose(
+            None,
+            SkillId::PointMutation,
+            vec![Substitution {
+                chain,
+                position: 26,
+                to: 'W',
+            }],
+            "test",
+        )
+        .expect("in scope")
+        .apply_to(&founder)
+        .expect("applies");
+
+    let config = PopulationConfig {
+        capacity: 8,
+        min_hamming: 0,
+        parent_temperature: 0.05,
+    };
+    let mut original = Population::new(config.clone());
+    original
+        .admit(scored(1, founder.clone(), 0.5))
+        .expect("admitted");
+    original
+        .admit(scored(2, variant.clone(), 0.6))
+        .expect("admitted");
+    assert!(original.admit(scored(3, founder.clone(), 0.7)).is_err());
+
+    let mut restored = Population::restore(
+        config,
+        original.members().to_vec(),
+        original.admitted_total(),
+        original.rejected_total(),
+    );
+
+    assert_eq!(restored.members(), original.members());
+    assert_eq!(restored.admitted_total(), original.admitted_total());
+    assert_eq!(restored.rejected_total(), original.rejected_total());
+    // The rebuilt fingerprint map names the member the duplicate matches,
+    // exactly as the population that recorded it would.
+    assert_eq!(
+        restored.admit(scored(4, founder.clone(), 0.9)),
+        Err(RejectReason::Duplicate { of: CandidateId(1) })
+    );
+    assert_eq!(
+        restored.admit(scored(5, variant.clone(), 0.9)),
+        Err(RejectReason::Duplicate { of: CandidateId(2) })
+    );
+    // The variant scored higher ipTM, so it is the best. Higher ipTM means
+    // lower loss.
+    assert_eq!(restored.best().map(|c| c.id), Some(CandidateId(2)));
+}
+
+#[test]
+fn a_restored_history_rebuilds_the_skill_stats_and_the_stagnation_count() {
+    let outcomes = [
+        CycleOutcome {
+            cycle: 1,
+            skill: SkillId::PointMutation,
+            proposed: 4,
+            admitted: 2,
+            rejected: 2,
+            best_loss: Some(0.8),
+            mean_loss: None,
+        },
+        CycleOutcome {
+            cycle: 2,
+            skill: SkillId::PointMutation,
+            proposed: 4,
+            admitted: 0,
+            rejected: 4,
+            best_loss: Some(0.8),
+            mean_loss: None,
+        },
+        CycleOutcome {
+            cycle: 3,
+            skill: SkillId::RegionRedesign,
+            proposed: 3,
+            admitted: 1,
+            rejected: 2,
+            best_loss: Some(0.5),
+            mean_loss: None,
+        },
+        CycleOutcome {
+            cycle: 4,
+            skill: SkillId::RegionRedesign,
+            proposed: 3,
+            admitted: 0,
+            rejected: 3,
+            best_loss: Some(0.6),
+            mean_loss: None,
+        },
+    ];
+
+    // Feed a history the way `run_cycle` does: one choice per cycle, then
+    // the per-candidate notes, then the record.
+    let mut history = SearchHistory::new();
+    for outcome in outcomes {
+        history.note_choice(outcome.skill);
+        history.note_proposals(outcome.skill, outcome.proposed);
+        for _ in 0..outcome.admitted {
+            history.note_admitted(outcome.skill);
+        }
+        for _ in 0..outcome.rejected {
+            history.note_rejected(outcome.skill);
+        }
+        history.record_cycle(outcome, 1e-3);
+    }
+    assert_eq!(history.cycles_without_improvement(), 1);
+
+    let restored = SearchHistory::restore(history.records().to_vec());
+    assert_eq!(restored.records(), history.records());
+    assert_eq!(restored.stats(), history.stats());
+    assert_eq!(restored.best_loss(), history.best_loss());
+    assert_eq!(
+        restored.cycles_without_improvement(),
+        history.cycles_without_improvement()
+    );
+    assert_eq!(restored.loss_curve(), history.loss_curve());
+}
+
+#[test]
 fn gates_name_the_failing_field() {
     let gates = Gates::default();
     let mut metrics = Metrics::zeroed();

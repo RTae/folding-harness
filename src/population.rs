@@ -75,6 +75,30 @@ impl Population {
         }
     }
 
+    /// Rebuild a population from members an earlier run recorded, so a
+    /// resumed search refuses the same duplicates the recorded one would.
+    /// The fingerprint map comes from the members. `admitted` and `rejected`
+    /// are the counters the recording run reported. No I/O happens here: the
+    /// caller parses the snapshot and passes the values in.
+    pub fn restore(
+        config: PopulationConfig,
+        members: Vec<Candidate>,
+        admitted: usize,
+        rejected: usize,
+    ) -> Self {
+        let fingerprints = members
+            .iter()
+            .map(|member| (member.sequence.fingerprint(), member.id))
+            .collect();
+        Population {
+            members,
+            fingerprints,
+            config,
+            admitted,
+            rejected,
+        }
+    }
+
     pub fn config(&self) -> &PopulationConfig {
         &self.config
     }

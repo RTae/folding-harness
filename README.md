@@ -13,7 +13,7 @@ renders better than a terminal does.
 > **Status: working proof of concept.** The cycle, the contract, the gates,
 > output re-verification, the population, the trace, the manifest, the
 > dashboard, the chat screen, the web view and the chat history are
-> implemented, and 226 tests pass. Count them with `cargo test` and sum the
+> implemented, and 257 tests pass. Count them with `cargo test` and sum the
 > `passed` figures in its `test result` lines. `fh run` completes end to end
 > both in-process and over HTTP, and produces the identical run either way.
 >
@@ -298,6 +298,54 @@ candidate rather than weighted away.
 digest and the service version, you can re-run a result and show that it used
 the same inputs. Set `FH_TASK_ROOT` to move the directory.
 
+### Resume a run
+
+`fh resume` continues a recorded run from its last completed cycle.
+
+```bash
+fh run task.yaml --cycles 4     # stops after 4 cycles, or is interrupted
+fh resume                       # continue the most recent task
+fh resume --cycles 16           # extend the planned total and continue
+fh resume --task <task-id>      # or --path <task-dir>, like fh board
+```
+
+The resumed run rebuilds the population, the per-cycle records and the
+admission counters from the task directory. It appends to `trace.jsonl` with
+the sequence numbers continuing, and candidate ids continue after the highest
+id the recorded run assigned. `run.json` gains `resumed_from_cycle`,
+`generator_reseeded`, `resumed_protocol` and `resumed_service_version`, and
+its `usage` reports both runs' spend. Its original `protocol` and
+`service_version` keep describing the recorded run, because `folds` and
+`best_candidate` span both runs.
+
+Three limits are deliberate.
+
+- **The config must match.** The resume loads the `task.yaml` saved in the
+  task directory and refuses to run when its digest is not the `config_sha256`
+  in `run.json`. Changing the gates mid-search would mix two acceptance
+  criteria in one population and one lineage, so no flag allows it. Start a
+  new task with `fh run` instead. `--cycles` extends the planned total
+  without touching the config, so extending a run is not a config change.
+- **The snapshot must be genuine.** A resume folds the members it restores
+  and designs from them, so it first checks every member of `population.json`
+  against the config and the trace: the scaffold's binder chains at the
+  scaffold's lengths, the config's residue at every position outside the
+  mutable scope, and the loss the member's own metrics and the trace's
+  scoring event produce. One failing member refuses the whole resume, and the
+  refusal names the file and the candidate. Restore the file from a copy the
+  recorded run wrote, or run the task again.
+- **The generator is re-seeded.** The manifest records the seed but not the
+  position in its stream, so a resumed run seeds a fresh generator and its
+  parent selection and proposals diverge from what one uninterrupted run
+  would have produced. The divergence has a second source: `snapshot()`
+  writes members in ranked order, so the resumed population restores a
+  different member order from the recorded run's insertion order, and
+  `select_parent` iterates members in that order. The original order is not
+  recoverable. The same config, seed and backend reproduce the same
+  trace for one uninterrupted run, but not across a resume. The
+  `task_resumed` trace event and the manifest record the re-seed rather than
+  hiding it.
+
 ## The dashboard
 
 `fh board` has five panes. **Overview** shows the loss curve, the per-cycle
@@ -502,15 +550,13 @@ Nearest first.
    separate agreement. Record which, per backend, in its adapter.
 2. **Inverse-folding and likelihood-guided executors**, behind the capabilities
    the router already checks.
-3. **Resume.** The trace and manifest are enough to rebuild a population and
-   continue. `TraceWriter::append` exists for it.
-4. **Prompt caching in the chat screen.** A long conversation resends its whole
+3. **Prompt caching in the chat screen.** A long conversation resends its whole
    history each turn. Caching the system prompt would cut that, and it only
    works against the first-party API.
-5. **An MCP server.** `rmcp` is the official Rust SDK, and MCP's Tasks
+4. **An MCP server.** `rmcp` is the official Rust SDK, and MCP's Tasks
    extension is a close match for this job contract. That is how the harness
    gets driven by an agent instead of only driving one.
-6. **Cost accounting.** GPU-seconds and token spend per run, which the open
+5. **Cost accounting.** GPU-seconds and token spend per run, which the open
    harnesses in this space generally do not surface.
 
 ## Licence

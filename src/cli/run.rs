@@ -68,6 +68,43 @@ pub(super) async fn run_config(
         }
     }
 
+    drive(orchestrator, paths, open_board).await
+}
+
+/// Continue a recorded run from its last completed cycle.
+///
+/// The config comes from the task.yaml saved in the task directory, and
+/// `Orchestrator::resume` refuses a run whose digest does not match what
+/// run.json recorded. `--cycles` extends the planned total without touching
+/// the config, so extending is not a config change.
+pub(super) async fn resume(
+    path: Option<PathBuf>,
+    task: Option<String>,
+    cycles: Option<u32>,
+    open_board: bool,
+    latency: Duration,
+) -> Result<()> {
+    let dir = resolve_task_dir(path, task)?;
+    let config = TaskConfig::load(dir.config())
+        .with_context(|| format!("loading the recorded config {}", dir.config().display()))?;
+    let (scaffold, scope) = config.resolve().context("resolving the scaffold")?;
+    let backend = backend_for(&config, &scaffold, &scope, latency)?;
+    let agent: Box<dyn DesignAgent> = Box::new(HeuristicAgent::new(config.design.seed));
+
+    println!("resuming {}", dir.root().display());
+    println!("scope: {}", scope.summary());
+
+    let orchestrator = Orchestrator::resume(config, backend, agent, dir.clone(), cycles)
+        .await
+        .context("resuming the run")?;
+
+    drive(orchestrator, dir, open_board).await
+}
+
+/// Run a prepared orchestrator, streaming events to stdout or under the
+/// dashboard. Shared by `fh run` and `fh resume`, so both behave identically
+/// once the orchestrator exists.
+async fn drive(orchestrator: Orchestrator, paths: TaskPaths, open_board: bool) -> Result<()> {
     if open_board {
         // stdout belongs to the dashboard, so no event sink here.
         let mut orchestrator = orchestrator;

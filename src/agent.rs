@@ -47,6 +47,13 @@ pub trait DesignAgent: Send {
     async fn reflect(&mut self, _state: &SearchState) -> Result<Option<String>, AgentError> {
         Ok(None)
     }
+
+    /// What this agent's model calls cost, so a run's manifest can carry the
+    /// bill. An agent that never calls a model keeps the default and reports
+    /// nothing, which reads differently from counting zero.
+    fn usage(&self) -> crate::usage::Usage {
+        crate::usage::Usage::default()
+    }
 }
 
 /// Deterministic policy over the legal set.
@@ -482,6 +489,10 @@ impl<P: ModelProvider> DesignAgent for LlmAgent<P> {
     async fn reflect(&mut self, state: &SearchState) -> Result<Option<String>, AgentError> {
         self.fallback.reflect(state).await
     }
+
+    fn usage(&self) -> crate::usage::Usage {
+        self.provider.usage()
+    }
 }
 
 #[cfg(test)]
@@ -578,6 +589,24 @@ mod tests {
         }
     }
 
+    struct CountingProvider {
+        answer: String,
+        spent: crate::usage::Usage,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingProvider {
+        fn model(&self) -> &str {
+            "counting-stub"
+        }
+        fn usage(&self) -> crate::usage::Usage {
+            self.spent
+        }
+        async fn complete(&self, _system: &str, _user: &str) -> Result<String, AgentError> {
+            Ok(self.answer.clone())
+        }
+    }
+
     struct BrokenProvider;
 
     #[async_trait]
@@ -624,6 +653,31 @@ mod tests {
             "{}",
             decision.decided_by
         );
+    }
+
+    #[test]
+    fn an_agent_that_never_calls_a_model_reports_no_spend() {
+        assert!(HeuristicAgent::new(1).usage().is_empty());
+        assert!(RandomAgent::new(1).usage().is_empty());
+    }
+
+    #[test]
+    fn an_llm_agent_reports_what_its_provider_spent() {
+        let spent = crate::usage::Usage {
+            calls: 2,
+            input_tokens: 300,
+            output_tokens: 40,
+            folds: 0,
+            fold_ms: 0,
+        };
+        let agent = LlmAgent::new(
+            CountingProvider {
+                answer: r#"{"skill":"point_mutation"}"#.to_string(),
+                spent,
+            },
+            1,
+        );
+        assert_eq!(agent.usage(), spent);
     }
 
     #[tokio::test]
