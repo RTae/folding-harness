@@ -84,8 +84,8 @@ impl Chain {
 /// Task YAML uses one-based inclusive bounds because that is how residues are
 /// numbered in the literature; the conversion happens once, in
 /// [`crate::config`], and everything downstream of it is zero-based half-open.
-/// Display converts back through [`Region::display_span`], the only place
-/// that adds one to a stored start.
+/// Display converts back through [`Region::display_span`]. A pinned residue
+/// converts back through [`FixedResidue::display_position`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Region {
     pub name: String,
@@ -108,6 +108,19 @@ pub struct RegionSpan {
 impl fmt::Display for RegionSpan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}..{}", self.start, self.end)
+    }
+}
+
+/// A pinned residue's position as every display writes it: one-based.
+///
+/// [`fmt::Display`] renders the number a task YAML writes, so a user can
+/// search their file for a printed position without converting anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayPosition(pub usize);
+
+impl fmt::Display for DisplayPosition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -147,6 +160,15 @@ pub struct FixedResidue {
     pub position: usize,
 }
 
+impl FixedResidue {
+    /// The position of this residue for display, one-based. This is the one
+    /// place that converts a stored pinned position back out. The conversion
+    /// into it lives in [`crate::config::TaskConfig::to_scaffold`].
+    pub fn display_position(&self) -> DisplayPosition {
+        DisplayPosition(self.position + 1)
+    }
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ScaffoldError {
     #[error("scaffold has no chains")]
@@ -169,28 +191,58 @@ pub enum ScaffoldError {
     NoTarget,
     #[error("region '{name}' references {chain}, which is not a binder chain")]
     RegionNotOnBinder { name: String, chain: ChainId },
-    #[error("region '{name}' spans {start}..{end} but {chain} has length {len}")]
+    #[error(
+        "region '{name}' spans {span} but {chain} has length {len}; {}",
+        region_out_of_bounds_fix(*span, *len)
+    )]
     RegionOutOfBounds {
         name: String,
         chain: ChainId,
-        start: usize,
-        end: usize,
+        /// One-based inclusive, the bounds a task YAML writes. Converted from
+        /// the stored region by [`Region::display_span`].
+        span: RegionSpan,
         len: usize,
     },
-    #[error("region '{name}' is empty")]
+    #[error("region '{name}' is empty; give it at least one residue")]
     EmptyRegion { name: String },
     #[error("regions '{a}' and '{b}' overlap")]
     OverlappingRegions { a: String, b: String },
     #[error("duplicate region name '{name}'")]
     DuplicateRegionName { name: String },
-    #[error("fixed residue {chain}:{position} is outside that chain (length {len})")]
+    #[error(
+        "fixed residue {chain}:{position} is outside that chain (length {len}); {}",
+        fixed_out_of_bounds_fix(*len)
+    )]
     FixedOutOfBounds {
         chain: ChainId,
-        position: usize,
+        /// One-based, the position a task YAML writes. Converted from the
+        /// stored pinned residue by [`FixedResidue::display_position`].
+        position: DisplayPosition,
         len: usize,
     },
     #[error("every mutable position is also pinned as a fixed residue: nothing left to design")]
     NothingMutable,
+}
+
+/// The fix for a region that ran past its chain, quoted in the one-based
+/// bounds the message shows. A `span.start` above `len` puts the whole region
+/// past the last residue, so lowering `end` alone cannot repair it.
+fn region_out_of_bounds_fix(span: RegionSpan, len: usize) -> String {
+    if span.start > len {
+        format!("lower start and end to {len} or less")
+    } else {
+        format!("lower end to {len} or less")
+    }
+}
+
+/// The fix for a pinned residue that ran past its chain. A chain of length 0
+/// is one this scaffold does not carry, so there is no position to lower to.
+fn fixed_out_of_bounds_fix(len: usize) -> String {
+    if len == 0 {
+        "that chain has no residues, so remove the entry".to_string()
+    } else {
+        format!("lower the position to {len} or less")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,8 +339,7 @@ impl Scaffold {
                 return Err(ScaffoldError::RegionOutOfBounds {
                     name: region.name.clone(),
                     chain: region.chain,
-                    start: region.start,
-                    end: region.end,
+                    span: region.display_span(),
                     len: chain.len(),
                 });
             }
@@ -310,7 +361,7 @@ impl Scaffold {
             if fixed.position >= len {
                 return Err(ScaffoldError::FixedOutOfBounds {
                     chain: fixed.chain,
-                    position: fixed.position,
+                    position: fixed.display_position(),
                     len,
                 });
             }
@@ -533,6 +584,11 @@ impl BinderSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TaskConfig;
+
+    /// Twelve residues, so a bound of 13 is visibly past the end.
+    const BINDER_12: &str = "QVQLVESGGGLV";
+    const TARGET: &str = "MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVLAGG";
 
     fn region(start: usize, end: usize) -> Region {
         Region {
@@ -541,6 +597,56 @@ mod tests {
             start,
             end,
         }
+    }
+
+    /// The twelve-residue binder chain `H` and the target chain `A`, for
+    /// scaffolds built by hand because no YAML can produce them.
+    fn chains() -> Vec<Chain> {
+        vec![
+            Chain {
+                id: ChainId(0),
+                label: "H".to_string(),
+                sequence: BINDER_12.to_string(),
+                role: ChainRole::Binder,
+            },
+            Chain {
+                id: ChainId(1),
+                label: "A".to_string(),
+                sequence: TARGET.to_string(),
+                role: ChainRole::Target,
+            },
+        ]
+    }
+
+    /// A task whose binder chain `H` is twelve residues long. `binder_extra`
+    /// is the block under test, written the way a user writes it, and must end
+    /// in a newline.
+    fn task_yaml(binder_extra: &str) -> String {
+        format!(
+            r#"name: numbering
+binder:
+  topology: vhh
+  chains:
+    - label: H
+      sequence: {BINDER_12}
+{binder_extra}target:
+  chains:
+    - label: A
+      sequence: {TARGET}
+design:
+  cycles: 1
+  batch_size: 1
+"#
+        )
+    }
+
+    /// The message a user sees when this config is turned into a scaffold.
+    fn rejection(yaml: &str) -> String {
+        let config = TaskConfig::from_yaml(yaml).expect("config parses");
+        config
+            .to_scaffold()
+            .expect_err("scaffold must be rejected")
+            .to_string()
     }
 
     #[test]
@@ -559,5 +665,111 @@ mod tests {
         // A YAML region of start 30, end 30 is stored as 29..30. It must
         // read back as 30..30, the case an off-by-one shows up in first.
         assert_eq!(region(29, 30).display_span().to_string(), "30..30");
+    }
+
+    #[test]
+    fn a_stored_pinned_position_displays_incremented_by_one() {
+        // A YAML `H:14` is stored as position 13. The display must show the
+        // number the user wrote, so a dropped increment (13) and a doubled
+        // one (15) both fail here.
+        let fixed = FixedResidue {
+            chain: ChainId(0),
+            position: 13,
+        };
+        assert_eq!(fixed.display_position().to_string(), "14");
+        assert_ne!(fixed.display_position().to_string(), "13");
+        assert_ne!(fixed.display_position().to_string(), "15");
+        // A chain's first residue is stored as 0 and must read as 1.
+        let first = FixedResidue {
+            chain: ChainId(0),
+            position: 0,
+        };
+        assert_eq!(first.display_position().to_string(), "1");
+    }
+
+    #[test]
+    fn a_region_past_the_end_of_its_chain_reports_the_bounds_the_config_wrote() {
+        // The config writes 10..16 and `to_scaffold` stores 9..16. A user
+        // searching their file for the reported span must find 10..16, and
+        // must be told which bound to move.
+        let message = rejection(&task_yaml(
+            "  regions:\n    - name: loop1\n      chain: H\n      start: 10\n      end: 16\n",
+        ));
+        assert!(message.contains("spans 10..16"), "{message}");
+        assert!(!message.contains("9..16"), "{message}");
+        assert!(message.contains("has length 12"), "{message}");
+        assert!(message.contains("lower end to 12 or less"), "{message}");
+    }
+
+    #[test]
+    fn a_region_wholly_past_its_chain_tells_the_user_to_move_both_bounds() {
+        // Start 20 is past residue 12, so lowering `end` alone cannot fix
+        // this region and the advice has to say so.
+        let message = rejection(&task_yaml(
+            "  regions:\n    - name: loop1\n      chain: H\n      start: 20\n      end: 24\n",
+        ));
+        assert!(message.contains("spans 20..24"), "{message}");
+        assert!(
+            message.contains("lower start and end to 12 or less"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_residue_past_its_chain_reports_the_position_the_config_wrote() {
+        // The config pins H:14 and `to_scaffold` stores 13. The message
+        // quotes the YAML form, the way it does for a region span.
+        let message = rejection(&task_yaml("  fixed_residues: [\"H:14\"]\n"));
+        assert!(message.contains("fixed residue chain0:14"), "{message}");
+        assert!(!message.contains("chain0:13"), "{message}");
+        assert!(
+            message.contains("lower the position to 12 or less"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_residue_on_a_chain_the_scaffold_lacks_says_to_remove_the_entry() {
+        // A chain length of 0 means the scaffold does not carry that chain
+        // id, so no position would be in range and lowering one is not the
+        // fix.
+        let scaffold = Scaffold {
+            topology: BinderTopology::Vhh,
+            chains: chains(),
+            regions: Vec::new(),
+            fixed: vec![FixedResidue {
+                chain: ChainId(7),
+                position: 4,
+            }],
+        };
+        let message = scaffold
+            .validate()
+            .expect_err("a pinned residue on an absent chain must be rejected")
+            .to_string();
+        assert!(
+            message.contains("that chain has no residues, so remove the entry"),
+            "{message}"
+        );
+        assert!(!message.contains("lower the position"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_region_tells_the_user_to_give_it_a_residue() {
+        // Only a hand-built scaffold can carry this. `to_scaffold` rejects
+        // `end < start` and stores `end == start` as a region of length one.
+        let scaffold = Scaffold {
+            topology: BinderTopology::Vhh,
+            chains: chains(),
+            regions: vec![region(5, 5)],
+            fixed: Vec::new(),
+        };
+        let message = scaffold
+            .validate()
+            .expect_err("an empty region must be rejected")
+            .to_string();
+        assert_eq!(
+            message,
+            "region 'loop1' is empty; give it at least one residue"
+        );
     }
 }
