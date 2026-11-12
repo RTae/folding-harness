@@ -59,8 +59,6 @@ pub(super) async fn web(port: u16, task_root: Option<PathBuf>) -> Result<()> {
     let root = task_root.unwrap_or_else(TaskPaths::default_root);
     let runs = TaskPaths::list(&root).unwrap_or_default();
 
-    // Loopback only: this serves local run data and authenticates nobody.
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     println!("reading {}", root.display());
     println!(
         "{} run(s) found{}",
@@ -72,10 +70,10 @@ pub(super) async fn web(port: u16, task_root: Option<PathBuf>) -> Result<()> {
         }
     );
     println!();
-    println!("open http://{addr}");
+    println!("open {}", fh::web::loopback_url(port));
     println!("ctrl-c to stop");
 
-    fh::web::serve(addr, root)
+    fh::web::serve(port, root)
         .await
         .map_err(|error| anyhow!("serving: {error}"))
 }

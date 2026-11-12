@@ -12,8 +12,10 @@ renders better than a terminal does.
 
 > **Status: working proof of concept.** The cycle, the contract, the gates, the
 > population, the trace, the manifest, the dashboard, the chat screen, the web
-> view and the chat history are implemented, and 119 tests pass. `fh run` completes end to end both in-process
-> and over HTTP, and produces the identical run either way.
+> view and the chat history are implemented, and 188 tests pass. Count them
+> with `cargo test` and sum the `passed` figures in its `test result` lines.
+> `fh run` completes end to end both in-process and over HTTP, and produces
+> the identical run either way.
 >
 > Not done yet: the model-backed skills, inverse folding and likelihood-guided
 > mutation, are declared in the contract and gated by the router but have no
@@ -365,9 +367,12 @@ fh web                      # http://127.0.0.1:8750
 fh web --port 9000 --task-root ./runs
 ```
 
-It binds to loopback only, because it serves local run data and authenticates
-nobody. The page, its stylesheet and its script are compiled into the binary,
-so there is still no Node, no asset directory and no build step. The server
+It binds to loopback only. `fh::web::serve` takes a port and binds the loopback
+address itself, and the router it serves is not public, so no external crate can
+obtain that router and bind it to a wider address. The view serves local run
+data and authenticates nobody. The page, its stylesheet and its script are
+compiled into the binary, so there is still no Node, no asset directory and no
+build step. The server
 only reads the task directory, so having the page open cannot disturb a run,
 and a run does not need the page.
 
