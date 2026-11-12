@@ -229,7 +229,7 @@ impl Orchestrator {
     ///
     /// The config must digest to the `config_sha256` the manifest recorded, or
     /// two searches would mix into one population and one lineage. `cycles_total`
-    /// extends the planned total past what the config says; the digest is
+    /// extends the planned total past what the config says. The digest is
     /// checked before it applies, so extending a run is not a config change.
     ///
     /// The generator cannot be restored: the manifest records the seed but not
@@ -487,6 +487,10 @@ impl Orchestrator {
             best_loss: best.as_ref().and_then(|candidate| candidate.loss),
             elapsed_ms,
         })?;
+        // The arm persists the same counters `run` does, through the same
+        // assembly. Without this, run.json keeps the empty usage `prepare`
+        // wrote and the founder fold never reaches a later resume.
+        self.record_progress()?;
         self.snapshot(0, false)?;
 
         Ok(RunSummary {
@@ -1908,6 +1912,128 @@ fold:
         let summary = manifest.usage.summary();
         assert!(summary.contains("fold(s)"), "{summary}");
         assert!(!summary.contains("call(s)"), "{summary}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The three sources of a resumed manifest's usage, end to end: the spend
+    /// run.json recorded, the folds this run's meter counted, and the model
+    /// calls this run's agent reports. Every counter is pinned separately, so
+    /// dropping `usage_base` from the sum or adding it twice fails here.
+    #[tokio::test]
+    async fn a_resumed_run_sums_recorded_spend_with_the_meter_and_the_agent() {
+        let dir = temp_dir("resume-usage");
+        run_stopped(&dir, 4242, 3).await;
+        let paths = crate::trace::TaskPaths::new(&dir);
+
+        let before: crate::trace::PopulationSnapshot =
+            crate::trace::read_json(paths.population()).expect("snapshot reads");
+
+        // Give the recorded run a spend of its own by editing run.json the
+        // way the corrupt-artifact tests edit population.json.
+        let mut value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(paths.manifest()).expect("manifest reads"),
+        )
+        .expect("manifest is json");
+        value["usage"] = serde_json::json!({
+            "calls": 10,
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "folds": 7,
+            "fold_ms": 3500,
+        });
+        std::fs::write(
+            paths.manifest(),
+            serde_json::to_string_pretty(&value).expect("encode"),
+        )
+        .expect("manifest writes");
+
+        let spent = crate::usage::Usage {
+            calls: 3,
+            input_tokens: 900,
+            output_tokens: 120,
+            folds: 0,
+            fold_ms: 0,
+        };
+        let config = TaskConfig::load(paths.config()).expect("recorded config loads");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 4242));
+        let mut orchestrator = Orchestrator::resume(
+            config,
+            backend,
+            Box::new(SpendingAgent {
+                inner: HeuristicAgent::new(4242),
+                spent,
+            }),
+            paths.clone(),
+            Some(6),
+        )
+        .await
+        .expect("resumes");
+        let summary = orchestrator.run().await.expect("runs");
+
+        // The meter holds only the resumed run's folds: `self.folds` starts
+        // at the snapshot's count and the summary spans both runs. The
+        // fixture reports `elapsed_ms` equal to its latency and `planted`
+        // uses zero latency, so the meter adds no fold_ms.
+        let new_folds = summary.folds - before.folds;
+        assert!(new_folds > 0, "the resumed run folded nothing");
+
+        let manifest: RunManifest =
+            crate::trace::read_json(paths.manifest()).expect("manifest reads");
+        assert_eq!(manifest.usage.calls, 10 + spent.calls);
+        assert_eq!(manifest.usage.input_tokens, 1000 + spent.input_tokens);
+        assert_eq!(manifest.usage.output_tokens, 200 + spent.output_tokens);
+        assert_eq!(manifest.usage.folds, 7 + new_folds as u64);
+        assert_eq!(manifest.usage.fold_ms, 3500);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The founder-only control arm persists the same counters `run` does:
+    /// the founder's fold and the agent's spend land in run.json rather than
+    /// staying in memory.
+    #[tokio::test]
+    async fn the_founder_only_arm_records_its_fold_and_the_agent_spend() {
+        let dir = temp_dir("founder-only-usage");
+        let config = TaskConfig::from_yaml(YAML).expect("config parses");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+
+        let spent = crate::usage::Usage {
+            calls: 1,
+            input_tokens: 400,
+            output_tokens: 60,
+            folds: 0,
+            fold_ms: 0,
+        };
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 21));
+        let mut orchestrator = Orchestrator::prepare(
+            config,
+            backend,
+            Box::new(SpendingAgent {
+                inner: HeuristicAgent::new(21),
+                spent,
+            }),
+            crate::trace::TaskPaths::new(&dir),
+            TaskId("founder-only".to_string()),
+        )
+        .await
+        .expect("prepares");
+
+        let summary = orchestrator.seed_founder_only().await.expect("completes");
+        assert_eq!(summary.folds, 1, "the founder fold is the arm's only fold");
+
+        let manifest: RunManifest =
+            crate::trace::read_json(crate::trace::TaskPaths::new(&dir).manifest())
+                .expect("manifest reads");
+        assert_eq!(manifest.folds, 1);
+        assert_eq!(manifest.usage.folds, 1);
+        // The fixture reports `elapsed_ms` equal to its latency and `planted`
+        // uses zero latency, so the fold costs no recorded time.
+        assert_eq!(manifest.usage.fold_ms, 0);
+        assert_eq!(manifest.usage.calls, spent.calls);
+        assert_eq!(manifest.usage.input_tokens, spent.input_tokens);
+        assert_eq!(manifest.usage.output_tokens, spent.output_tokens);
 
         std::fs::remove_dir_all(&dir).ok();
     }

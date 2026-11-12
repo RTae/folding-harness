@@ -335,7 +335,7 @@ fn a_restored_population_still_refuses_the_duplicates_it_recorded() {
         restored.admit(scored(5, variant.clone(), 0.9)),
         Err(RejectReason::Duplicate { of: CandidateId(2) })
     );
-    // The variant scored higher ipTM, so it is the best; higher ipTM means
+    // The variant scored higher ipTM, so it is the best. Higher ipTM means
     // lower loss.
     assert_eq!(restored.best().map(|c| c.id), Some(CandidateId(2)));
 }
