@@ -8,7 +8,7 @@
 //! the handlers below are the whole protocol.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -185,7 +185,22 @@ async fn status(
     }
 }
 
-/// Bind and serve until the process is stopped.
+/// The default address for [`serve`]: loopback on `port`.
+///
+/// `fh serve` takes both the address it binds and the URLs it prints from
+/// this function, so the two cannot drift apart. A caller that wants the
+/// service reachable from another machine builds its own [`SocketAddr`] and
+/// passes it to [`serve`].
+pub fn loopback_addr(port: u16) -> SocketAddr {
+    (Ipv4Addr::LOCALHOST, port).into()
+}
+
+/// Bind `addr` and serve until the process is stopped.
+///
+/// The service authenticates nobody. A non-loopback `addr` puts an
+/// unauthenticated compute endpoint on that interface, so a deployment
+/// reachable from another machine needs protection of its own. The CLI binds
+/// [`loopback_addr`], which answers only on 127.0.0.1.
 pub async fn serve(
     addr: SocketAddr,
     backend: Arc<dyn FoldBackend>,
@@ -193,4 +208,18 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app(backend)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CLI prints the URL it builds from this address and binds the same
+    /// value, so the default must stay loopback and keep the caller's port.
+    #[test]
+    fn the_default_address_is_loopback_and_carries_the_port() {
+        let addr = loopback_addr(8080);
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 8080);
+    }
 }

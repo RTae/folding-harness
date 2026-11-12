@@ -19,8 +19,7 @@ terms, which are often stricter than the Apache-2.0 on this code.
 - **One Rust crate in `src/`.** No Python, no Node, no second runtime, no
   build step for assets. The web view's page, script and stylesheet compile
   into the binary.
-- **Run all four commands before you call a change done.** There is no CI and
-  no pre-commit hook in this repo, so they are the only gate.
+- **Run all four commands before you call a change done.**
 
   ```bash
   cargo build
@@ -28,6 +27,19 @@ terms, which are often stricter than the Apache-2.0 on this code.
   cargo fmt --all
   cargo clippy --all-targets -- -D warnings
   ```
+
+- **Install the pre-commit hook once.** It runs the two fast checks, so a
+  misformatted or warning-carrying commit cannot land. There is still no CI, so
+  the hook and your own runs are the whole gate.
+
+  ```bash
+  cp scripts/pre-commit .git/hooks/pre-commit
+  chmod +x .git/hooks/pre-commit
+  ```
+
+  The hook is a copy rather than a symlink or a `core.hooksPath` setting, so it
+  stays out of the git config and out of anyone else's clone until they install
+  it. Fix what it reports. Do not skip it.
 
 - **The fixture path must work with nothing else present.** A GPU, a compute
   service and the network may all be absent. A change that makes `fh run`
@@ -100,7 +112,13 @@ Two separations carry the design and should survive refactors:
 - Every user-causable error names the field or the file and says what to do.
 - Tests live beside the code in `#[cfg(test)] mod tests`, named after the
   behaviour they pin rather than the function they call.
-- No test sleeps and no test depends on a time window.
+- No test sleeps and no test depends on a time window. One exception: a bound
+  that turns a deadlock into a named failure is a guard, not a timing
+  assertion. It is allowed only where the test waits on a channel that the code
+  under test signals, the healthy case completes orders of magnitude inside the
+  bound, and the failure message names the property that did not hold. A test
+  that proves incremental behaviour needs this, because the alternative is a
+  suite that hangs instead of reporting.
 - The test runner takes no seed, so a rule that asks for three runs under
   three seeds translates rather than applies. `rust-toolchain.toml` pins
   stable, and libtest's `--shuffle` seed is nightly only. Run the suite three

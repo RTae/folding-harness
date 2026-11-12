@@ -11,11 +11,14 @@
 //! dashboard reads and holds no state of its own, so it cannot disturb a run
 //! and a run does not need it.
 //!
-//! It binds to loopback. The data is a local research run, and nothing here
+//! It binds to loopback, and [`serve`] is what makes that true. It takes a
+//! port and binds the loopback address itself, and the router it serves is
+//! `pub(crate)`, so no external crate can obtain that router and bind it to a
+//! wider address. The data is a local research run, and nothing here
 //! authenticates anybody.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Path as UrlPath, Query, State};
@@ -33,7 +36,7 @@ const SCRIPT: &str = include_str!("app.js");
 const STYLE: &str = include_str!("app.css");
 
 #[derive(Clone)]
-pub struct WebState {
+struct WebState {
     root: PathBuf,
 }
 
@@ -135,15 +138,10 @@ fn scope_view(paths: &TaskPaths) -> Option<ScopeView> {
 /// Reject anything that is not a plain directory name.
 ///
 /// Task ids reach this from a URL, so a joined path could otherwise climb out
-/// of the task root. The id must also be a directory that is actually there.
+/// of the task root. The syntax rule is [`trace::check_id`], shared with
+/// `history::load`. The id must also be a directory that is actually there.
 fn task_dir(root: &Path, id: &str) -> Option<TaskPaths> {
-    let safe = !id.is_empty()
-        && id.len() <= 128
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        && !id.starts_with('.');
-    if !safe {
+    if trace::check_id("task id", id).is_err() {
         return None;
     }
     let candidate = root.join(id);
@@ -158,7 +156,7 @@ fn asset(body: &'static str, content_type: &'static str) -> Response {
     ([(header::CONTENT_TYPE, content_type)], body).into_response()
 }
 
-pub fn app(root: PathBuf) -> Router {
+pub(crate) fn app(root: PathBuf) -> Router {
     Router::new()
         .route("/", get(|| async { Html(INDEX) }))
         .route(
@@ -242,12 +240,38 @@ async fn structure(
     }
 }
 
-/// Bind and serve until the process stops.
+/// The loopback address for `port`. The bind and the printed URL both take
+/// their address from here, so the two cannot drift apart.
+fn loopback_addr(port: u16) -> std::net::SocketAddr {
+    (Ipv4Addr::LOCALHOST, port).into()
+}
+
+/// Bind `port` on the loopback address. Port 0 asks the OS to pick a free
+/// port, which the tests use.
+async fn bind_loopback(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(loopback_addr(port)).await
+}
+
+/// The URL of the address [`serve`] binds on `port`, formatted for printing.
+///
+/// `serve` runs until the process stops and returns nothing, so a caller
+/// cannot read the bound address back. This function and `bind_loopback` both
+/// take the address from [`loopback_addr`], which keeps the URL a caller
+/// prints from drifting away from the address the server binds.
+pub fn loopback_url(port: u16) -> String {
+    format!("http://{}", loopback_addr(port))
+}
+
+/// Bind the loopback address on `port` and serve until the process stops.
+///
+/// The page serves run data, including the sequences from a task config, and
+/// authenticates nobody, so the loopback decision lives here rather than in
+/// each caller. A caller picks the port and cannot widen the address.
 pub async fn serve(
-    addr: SocketAddr,
+    port: u16,
     root: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = bind_loopback(port).await?;
     axum::serve(listener, app(root)).await?;
     Ok(())
 }
@@ -256,17 +280,33 @@ pub async fn serve(
 mod tests {
     use super::*;
 
-    fn temp_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("fh-web-{name}-{}", trace::now_ms()));
-        std::fs::create_dir_all(dir.join("1700-demo")).expect("task dir");
-        dir
+    /// A temp task root that removes itself when the test ends. `Drop` runs
+    /// even when an assertion fails and the test panics, which a trailing
+    /// `remove_dir_all` does not.
+    struct TempRoot {
+        path: PathBuf,
+    }
+
+    impl TempRoot {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("fh-web-{name}-{}", trace::now_ms()));
+            std::fs::create_dir_all(dir.join("1700-demo")).expect("task dir");
+            Self { path: dir }
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            // A failure to remove must not mask the panic that is unwinding.
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
     #[test]
     fn a_task_id_cannot_climb_out_of_the_root() {
-        let root = temp_root("traversal");
+        let root = TempRoot::new("traversal");
         // The real one resolves.
-        assert!(task_dir(&root, "1700-demo").is_some());
+        assert!(task_dir(&root.path, "1700-demo").is_some());
 
         // These must not, whatever the filesystem would make of them.
         for attempt in [
@@ -282,22 +322,19 @@ mod tests {
             "a\\b",
         ] {
             assert!(
-                task_dir(&root, attempt).is_none(),
+                task_dir(&root.path, attempt).is_none(),
                 "{attempt:?} should have been refused"
             );
         }
 
         // A name that is well-formed but absent is still refused.
-        assert!(task_dir(&root, "1700-nothing").is_none());
-
-        std::fs::remove_dir_all(&root).ok();
+        assert!(task_dir(&root.path, "1700-nothing").is_none());
     }
 
     #[test]
     fn an_over_long_id_is_refused() {
-        let root = temp_root("long");
-        assert!(task_dir(&root, &"a".repeat(129)).is_none());
-        std::fs::remove_dir_all(&root).ok();
+        let root = TempRoot::new("long");
+        assert!(task_dir(&root.path, &"a".repeat(129)).is_none());
     }
 
     /// Every element the script looks up has to exist, or a pane silently
@@ -349,6 +386,100 @@ mod tests {
         for (path, body) in routes {
             assert!(!body.is_empty(), "{path} is empty");
         }
+    }
+
+    /// A run the picker can show. `runs` skips a task directory whose
+    /// `run.json` is missing or unreadable, so the list stays empty without
+    /// this.
+    fn write_manifest(paths: &TaskPaths) {
+        let manifest = RunManifest {
+            task_id: "1700-demo".to_string(),
+            name: "demo".to_string(),
+            harness_version: "test".to_string(),
+            started_at_ms: 0,
+            finished_at_ms: None,
+            seed: 7,
+            backend: "fixture".to_string(),
+            model: "none".to_string(),
+            protocol: "test".to_string(),
+            service_version: None,
+            config_sha256: "0".to_string(),
+            cycles_planned: 2,
+            cycles_completed: 1,
+            folds: 3,
+            best_candidate: None,
+            best_loss: Some(0.5),
+            chat_id: None,
+            usage: Default::default(),
+            resumed_from_cycle: None,
+            generator_reseeded: false,
+        };
+        let encoded = serde_json::to_vec(&manifest).expect("encode manifest");
+        std::fs::write(paths.manifest(), encoded).expect("write manifest");
+    }
+
+    #[tokio::test]
+    async fn binding_a_port_gives_a_socket_on_the_loopback_address() {
+        let listener = bind_loopback(0).await.expect("bind");
+        let addr = listener.local_addr().expect("bound address");
+        assert!(
+            addr.ip().is_loopback(),
+            "serve would bind {addr}, which is not loopback"
+        );
+    }
+
+    /// The binary prints the URL from [`loopback_url`] and `serve` binds the
+    /// address from `bind_loopback`. Both must name the loopback address for
+    /// the same port, or the printed URL lies about where the server listens.
+    #[test]
+    fn the_formatted_url_is_the_loopback_url_for_that_port() {
+        let url = loopback_url(8750);
+        assert_eq!(url, "http://127.0.0.1:8750");
+        let authority = url.strip_prefix("http://").expect("an http URL");
+        let addr: std::net::SocketAddr = authority.parse().expect("host and port");
+        assert!(addr.ip().is_loopback(), "{addr} is not loopback");
+        assert_eq!(addr.port(), 8750);
+    }
+
+    /// The exact-string test above pins the format. This one pins the
+    /// agreement: a change that moves only the binder, say to `::1`, makes
+    /// the printed URL lie about where the server listens, and fails here.
+    #[tokio::test]
+    async fn the_printed_url_names_the_address_the_server_binds() {
+        let listener = bind_loopback(0).await.expect("bind");
+        let bound = listener.local_addr().expect("bound address");
+        let url = loopback_url(bound.port());
+        let authority = url.strip_prefix("http://").expect("an http URL");
+        let printed: std::net::SocketAddr = authority.parse().expect("host and port");
+        assert_eq!(
+            printed, bound,
+            "serve binds {bound} but the printed URL names {printed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serving_a_run_directory_returns_the_runs_list() {
+        let root = TempRoot::new("serve");
+        write_manifest(&TaskPaths::new(root.path.join("1700-demo")));
+
+        // Bind first, so the port is listening before the request goes out.
+        let listener = bind_loopback(0).await.expect("bind");
+        let addr = listener.local_addr().expect("bound address");
+        let served = root.path.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app(served)).await;
+        });
+
+        let body: serde_json::Value = reqwest::get(format!("http://{addr}/api/runs"))
+            .await
+            .expect("request the runs list")
+            .json()
+            .await
+            .expect("read the runs list");
+        let rows = body.as_array().expect("the runs list is an array");
+        assert_eq!(rows.len(), 1, "expected only 1700-demo, got {body}");
+        assert_eq!(rows[0]["id"], "1700-demo");
+        assert_eq!(rows[0]["name"], "demo");
     }
 
     #[tokio::test]

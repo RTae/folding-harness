@@ -185,18 +185,11 @@ pub fn list(root: &Path) -> std::io::Result<Vec<ChatRecord>> {
 pub fn load(root: &Path, id: Option<&str>) -> std::io::Result<ChatRecord> {
     match id {
         Some(id) => {
-            // The id becomes a filename, so it has to be a plain name.
-            let safe = !id.is_empty()
-                && id.len() <= 128
-                && id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-            if !safe {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("'{id}' is not a chat id"),
-                ));
-            }
+            // The id becomes a filename, so it has to be a plain name. The
+            // syntax rule is `trace::check_id`, shared with the web view's
+            // task id guard.
+            trace::check_id("chat id", id)
+                .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?;
             trace::read_json(root.join(format!("{id}.json")))
         }
         None => list(root)?

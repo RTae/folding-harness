@@ -125,6 +125,12 @@ pub enum RejectReason {
     FoldFailed {
         detail: String,
     },
+    /// The service reported back a sequence other than the one the harness
+    /// sent. `chain` is the chain label, `detail` says what differs.
+    SequenceMismatch {
+        chain: String,
+        detail: String,
+    },
 }
 
 impl RejectReason {
@@ -147,6 +153,7 @@ impl RejectReason {
             RejectReason::Unscored => "unscored",
             RejectReason::Invalid { .. } => "invalid",
             RejectReason::FoldFailed { .. } => "fold_failed",
+            RejectReason::SequenceMismatch { .. } => "sequence_mismatch",
         }
     }
 }
@@ -180,6 +187,9 @@ impl std::fmt::Display for RejectReason {
             RejectReason::Unscored => write!(f, "candidate has no loss"),
             RejectReason::Invalid { detail } => write!(f, "invalid: {detail}"),
             RejectReason::FoldFailed { detail } => write!(f, "fold failed: {detail}"),
+            RejectReason::SequenceMismatch { chain, detail } => {
+                write!(f, "sequence mismatch on chain {chain}: {detail}")
+            }
         }
     }
 }

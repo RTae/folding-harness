@@ -10,11 +10,12 @@ watching a run over SSH without forwarding a port, a terminal chat screen for
 setting a run up by describing it, and a local web view for when a browser
 renders better than a terminal does.
 
-> **Status: working proof of concept.** The cycle, the contract, the gates, the
-> population, the trace, the manifest, the dashboard, the chat screen, the web
-> view and the chat history are implemented, and 184 tests pass. `fh run`
-> completes end to end both in-process and over HTTP, and produces the identical
-> run either way. `cargo test` regenerates that count.
+> **Status: working proof of concept.** The cycle, the contract, the gates,
+> output re-verification, the population, the trace, the manifest, the
+> dashboard, the chat screen, the web view and the chat history are
+> implemented, and 221 tests pass. Count them with `cargo test` and sum the
+> `passed` figures in its `test result` lines. `fh run` completes end to end
+> both in-process and over HTTP, and produces the identical run either way.
 >
 > Not done yet: the model-backed skills, inverse folding and likelihood-guided
 > mutation, are declared in the contract and gated by the router but have no
@@ -236,7 +237,9 @@ fh serve --task task.yaml --latency-ms 200
 fh run task.yaml --url http://127.0.0.1:8080
 ```
 
-The only difference between the two modes is whether the bytes crossed a socket.
+`fh serve` binds loopback on `--port`, 8080 by default, and authenticates
+nobody. The only difference between the two modes is whether the bytes crossed
+a socket.
 
 ## The cycle
 
@@ -399,9 +402,12 @@ fh web                      # http://127.0.0.1:8750
 fh web --port 9000 --task-root ./runs
 ```
 
-It binds to loopback only, because it serves local run data and authenticates
-nobody. The page, its stylesheet and its script are compiled into the binary,
-so there is still no Node, no asset directory and no build step. The server
+It binds to loopback only. `fh::web::serve` takes a port and binds the loopback
+address itself, and the router it serves is not public, so no external crate can
+obtain that router and bind it to a wider address. The view serves local run
+data and authenticates nobody. The page, its stylesheet and its script are
+compiled into the binary, so there is still no Node, no asset directory and no
+build step. The server
 only reads the task directory, so having the page open cannot disturb a run,
 and a run does not need the page.
 
@@ -527,18 +533,15 @@ Nearest first.
    Licensing is not uniform even within one repository. Some projects' LICENSE
    covers weights explicitly, some are silent, and some put weights under a
    separate agreement. Record which, per backend, in its adapter.
-2. **Output re-verification.** Check the returned structure's sequence against
-   the proposal, so a backend that silently renumbers or substitutes is caught
-   rather than scored.
-3. **Inverse-folding and likelihood-guided executors**, behind the capabilities
+2. **Inverse-folding and likelihood-guided executors**, behind the capabilities
    the router already checks.
-4. **Prompt caching in the chat screen.** A long conversation resends its whole
+3. **Prompt caching in the chat screen.** A long conversation resends its whole
    history each turn. Caching the system prompt would cut that, and it only
    works against the first-party API.
-5. **An MCP server.** `rmcp` is the official Rust SDK, and MCP's Tasks
+4. **An MCP server.** `rmcp` is the official Rust SDK, and MCP's Tasks
    extension is a close match for this job contract. That is how the harness
    gets driven by an agent instead of only driving one.
-6. **Cost accounting.** GPU-seconds and token spend per run, which the open
+5. **Cost accounting.** GPU-seconds and token spend per run, which the open
    harnesses in this space generally do not surface.
 
 ## Licence

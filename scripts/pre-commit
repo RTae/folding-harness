@@ -1,0 +1,28 @@
+#!/bin/sh
+# Pre-commit gate for folding-harness. Install with:
+#
+#   cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#
+# Runs the two checks that catch a broken commit fastest. `cargo test` is left
+# out on purpose: it is the developer's call when to run the suite, and a hook
+# that takes too long gets disabled. AGENTS.md lists all four commands.
+
+set -e
+
+say() { printf '%s\n' "$1"; }
+
+say "pre-commit: cargo fmt --all --check"
+if ! cargo fmt --all --check; then
+	say ""
+	say "pre-commit: formatting is off. Run 'cargo fmt --all' and stage the result."
+	exit 1
+fi
+
+say "pre-commit: cargo clippy --all-targets -- -D warnings"
+if ! cargo clippy --all-targets -- -D warnings; then
+	say ""
+	say "pre-commit: clippy reported a warning. Fix it rather than skipping the hook."
+	exit 1
+fi
+
+say "pre-commit: clean"
