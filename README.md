@@ -237,7 +237,9 @@ fh serve --task task.yaml --latency-ms 200
 fh run task.yaml --url http://127.0.0.1:8080
 ```
 
-The only difference between the two modes is whether the bytes crossed a socket.
+`fh serve` binds loopback on `--port`, 8080 by default, and authenticates
+nobody. The only difference between the two modes is whether the bytes crossed
+a socket.
 
 ## The cycle
 
