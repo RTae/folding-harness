@@ -12,8 +12,9 @@ renders better than a terminal does.
 
 > **Status: working proof of concept.** The cycle, the contract, the gates, the
 > population, the trace, the manifest, the dashboard, the chat screen, the web
-> view and the chat history are implemented, and 119 tests pass. `fh run` completes end to end both in-process
-> and over HTTP, and produces the identical run either way.
+> view and the chat history are implemented, and 184 tests pass. `fh run`
+> completes end to end both in-process and over HTTP, and produces the identical
+> run either way. `cargo test` regenerates that count.
 >
 > Not done yet: the model-backed skills, inverse folding and likelihood-guided
 > mutation, are declared in the contract and gated by the router but have no
@@ -455,17 +456,19 @@ no Node, and no second runtime.
 | `src/fold/` | `FoldBackend` trait, `fixture.rs`, `http.rs`, `server.rs` |
 | `src/skills/` | design skills and `router.rs` |
 | `src/agent.rs` | the decision layer and the `ModelProvider` trait |
-| `src/provider.rs` | the Claude Messages API over raw HTTP, with streaming |
+| `src/provider/` | the Claude Messages and OpenAI-compatible APIs over raw HTTP, with streaming, and the SSE parser |
 | `src/plan.rs` | prose to a validated task config |
 | `src/fasta.rs` | a minimal FASTA reader |
 | `src/trace.rs` | event log, task directory layout, run manifest |
 | `src/history.rs` | saved chats, and the link between a chat and its runs |
 | `src/bench.rs` | policy comparison against the fixture's planted optimum |
 | `src/settings.rs` | remembered provider settings, and where each value came from |
+| `src/usage.rs` | what a run spent: backend milliseconds and model tokens |
 | `src/web/` | the local web view: `mod.rs`, plus the page, script and stylesheet |
 | `src/orchestrator.rs` | the cycle |
-| `src/tui/` | the dashboard, `chat.rs`, and `structure.rs` for the backbone projection |
-| `src/main.rs` | the `fh` command |
+| `src/tui/` | the dashboard, `chat.rs`, the `input.rs` line editor, `command.rs` for slash commands, and `structure.rs` for the backbone projection |
+| `src/cli/` | the `fh` subcommands. These belong to the binary, so `anyhow` and the terminal stay out of the library |
+| `src/main.rs` | argument parsing, then a hand-off to `cli::dispatch` |
 | `src/tests.rs` | tests for the domain layer |
 
 The layering is a convention here rather than something the compiler enforces,
