@@ -72,6 +72,38 @@ impl SearchHistory {
         Self::default()
     }
 
+    /// Rebuild the history from the cycle records an earlier run left, so a
+    /// resumed run routes and chooses with the search so far in view.
+    ///
+    /// One completed cycle chooses exactly one skill and records it, so the
+    /// record count per skill is its `chosen` count, and the per-cycle
+    /// `proposed`, `admitted` and `rejected` numbers are exactly what the
+    /// matching `note_*` calls added to [`SkillStats`]. A cycle that failed
+    /// after its choice left no record and is not counted, which is right:
+    /// a resume repeats that cycle from scratch. No I/O happens here.
+    pub fn restore(records: Vec<CycleRecord>) -> Self {
+        let mut history = Self::default();
+        for record in &records {
+            let stats = history.stats.entry(record.skill).or_default();
+            stats.chosen += 1;
+            stats.proposed += record.proposed as u32;
+            stats.admitted += record.admitted as u32;
+            stats.rejected += record.rejected as u32;
+
+            if record.improved {
+                history.cycles_without_improvement = 0;
+            } else {
+                history.cycles_without_improvement =
+                    history.cycles_without_improvement.saturating_add(1);
+            }
+            if let Some(loss) = record.best_loss {
+                history.best_loss = Some(history.best_loss.map_or(loss, |old| old.min(loss)));
+            }
+        }
+        history.records = records;
+        history
+    }
+
     pub fn note_choice(&mut self, skill: SkillId) {
         self.stats.entry(skill).or_default().chosen += 1;
     }

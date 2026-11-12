@@ -32,9 +32,10 @@ impl Usage {
         self.input_tokens + self.output_tokens
     }
 
-    /// Both snapshots added together, field by field. One meter may hold the
-    /// fold counts while another source reports the model spend, and the
-    /// manifest carries the total.
+    /// Both snapshots added together, field by field. One source may hold the
+    /// fold counts while another reports the model spend, and a resumed run
+    /// adds what the recorded run spent to what this one spends. The manifest
+    /// carries the total.
     pub fn summed_with(self, other: Usage) -> Usage {
         Usage {
             calls: self.calls + other.calls,
@@ -192,6 +193,34 @@ mod tests {
             }
         );
         assert_eq!(folds.summed_with(Usage::default()), folds);
+    }
+
+    #[test]
+    fn a_resumed_run_reports_both_spends_summed() {
+        let recorded = Usage {
+            calls: 2,
+            input_tokens: 100,
+            output_tokens: 40,
+            folds: 5,
+            fold_ms: 2500,
+        };
+        let fresh = Usage {
+            calls: 1,
+            input_tokens: 10,
+            output_tokens: 5,
+            folds: 3,
+            fold_ms: 900,
+        };
+        assert_eq!(
+            recorded.summed_with(fresh),
+            Usage {
+                calls: 3,
+                input_tokens: 110,
+                output_tokens: 45,
+                folds: 8,
+                fold_ms: 3400,
+            }
+        );
     }
 
     #[test]

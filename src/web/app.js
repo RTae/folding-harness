@@ -628,6 +628,8 @@ function summarise(r) {
   switch (r.event) {
     case "task_started":
       return `${r.name} on ${r.backend} (${r.model}), ${r.cycles} cycles`;
+    case "task_resumed":
+      return `resumed after cycle ${r.cycle} of ${r.cycles_planned}, seed ${r.seed}; the generator was re-seeded, so choices from here diverge from one uninterrupted run`;
     case "founder_scored":
       return `founder ${cid(r.candidate)} loss ${four(r.loss)}`;
     case "cycle_started":

@@ -48,6 +48,18 @@ pub enum Event {
         scope: String,
         gates: String,
     },
+    TaskResumed {
+        /// The cycle the recorded run completed. This run continues from the
+        /// next one.
+        cycle: u32,
+        /// Total cycles planned now, counting the completed ones.
+        cycles_planned: u32,
+        seed: u64,
+        /// Always true on a resume: the position in the generator's stream is
+        /// not recorded, so the generator is seeded anew from `seed` and the
+        /// choices after this point diverge from one uninterrupted run.
+        generator_reseeded: bool,
+    },
     FounderScored {
         candidate: CandidateId,
         loss: f64,
@@ -146,6 +158,7 @@ impl Event {
     pub fn kind(&self) -> &'static str {
         match self {
             Event::TaskStarted { .. } => "task_started",
+            Event::TaskResumed { .. } => "task_resumed",
             Event::FounderScored { .. } => "founder_scored",
             Event::CycleStarted { .. } => "cycle_started",
             Event::SkillRouted { .. } => "skill_routed",
@@ -180,7 +193,23 @@ impl Event {
             | Event::CycleFinished { cycle, .. }
             | Event::Stagnation { cycle, .. }
             | Event::Note { cycle, .. }
+            | Event::TaskResumed { cycle, .. }
             | Event::TaskFailed { cycle, .. } => Some(*cycle),
+            _ => None,
+        }
+    }
+
+    /// The candidate an event names, when it names one. A resume reads this
+    /// back to find the highest id the recorded run ever assigned.
+    pub fn candidate(&self) -> Option<CandidateId> {
+        match self {
+            Event::FounderScored { candidate, .. }
+            | Event::FoldStarted { candidate, .. }
+            | Event::FoldFinished { candidate, .. }
+            | Event::FoldFailed { candidate, .. }
+            | Event::Scored { candidate, .. }
+            | Event::Rejected { candidate, .. }
+            | Event::Admitted { candidate, .. } => Some(*candidate),
             _ => None,
         }
     }
@@ -195,6 +224,15 @@ impl Event {
                 cycles,
                 ..
             } => format!("task '{name}' on {backend} ({model}), {cycles} cycles"),
+            Event::TaskResumed {
+                cycle,
+                cycles_planned,
+                seed,
+                ..
+            } => format!(
+                "resumed after cycle {cycle} of {cycles_planned}, seed {seed}; the generator \
+                 was re-seeded, so choices from here diverge from one uninterrupted run"
+            ),
             Event::FounderScored { candidate, loss } => {
                 format!("founder {candidate} scored, loss {loss:.4}")
             }
@@ -381,6 +419,12 @@ pub struct PopulationSnapshot {
     pub records: Vec<CycleRecord>,
     pub folds: usize,
     pub running: bool,
+    /// Admission counters of the retained population, so a resumed run
+    /// restores what the recorded run reported instead of starting at zero.
+    #[serde(default)]
+    pub admitted_total: usize,
+    #[serde(default)]
+    pub rejected_total: usize,
 }
 
 /// Alpha-carbon trace for one candidate, so the viewer can draw it without
@@ -419,8 +463,28 @@ pub struct RunManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
     /// What the run spent: folds, backend time, and model tokens if any.
+    /// Across a resume this is the sum of both runs' spend.
     #[serde(default)]
     pub usage: crate::usage::Usage,
+    /// The cycle this run resumed from, when it resumed. The run continued
+    /// from `resumed_from_cycle + 1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from_cycle: Option<u32>,
+    /// True when the run resumed: the position in the generator's stream is
+    /// not recorded, so the generator was seeded anew from `seed` and the
+    /// choices after the resume diverge from one uninterrupted run.
+    #[serde(default)]
+    pub generator_reseeded: bool,
+    /// The protocol the resumed run's health check reported. `protocol` and
+    /// `service_version` keep describing the run that produced the recorded
+    /// artifacts, while `folds`, `usage` and `best_candidate` span both runs,
+    /// so the resumed run's service identity is recorded beside them rather
+    /// than written over them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_protocol: Option<String>,
+    /// The service version the resumed run's health check reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_service_version: Option<String>,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -677,6 +741,80 @@ mod tests {
         assert_eq!(sha256_hex(b"name: demo"), sha256_hex(b"name: demo"));
         assert_ne!(sha256_hex(b"name: demo"), sha256_hex(b"name: demo2"));
         assert_eq!(sha256_hex(b"").len(), 64);
+    }
+
+    /// The resume fields are additive: a `run.json` or `population.json`
+    /// written before they existed still reads, with defaults in their place.
+    #[test]
+    fn artifacts_from_before_the_resume_fields_still_read() {
+        let manifest_json = r#"{
+            "task_id": "1-demo",
+            "name": "demo",
+            "harness_version": "0.1.0",
+            "started_at_ms": 1,
+            "finished_at_ms": null,
+            "seed": 7,
+            "backend": "fixture",
+            "model": "fixture",
+            "protocol": "fh.fold/v1",
+            "service_version": null,
+            "config_sha256": "00",
+            "cycles_planned": 4,
+            "cycles_completed": 4,
+            "folds": 9,
+            "best_candidate": null,
+            "best_loss": null
+        }"#;
+        let manifest: RunManifest =
+            serde_json::from_str(manifest_json).expect("old manifest reads");
+        assert_eq!(manifest.resumed_from_cycle, None);
+        assert!(!manifest.generator_reseeded);
+        assert_eq!(manifest.resumed_protocol, None);
+        assert_eq!(manifest.resumed_service_version, None);
+        assert!(manifest.usage.is_empty());
+        assert!(manifest.chat_id.is_none());
+
+        let snapshot_json = r#"{
+            "task_id": "1-demo",
+            "name": "demo",
+            "cycle": 4,
+            "cycles_planned": 4,
+            "updated_at_ms": 1,
+            "scope": "8 positions",
+            "stats": {"size": 0, "best_loss": null, "mean_loss": null, "worst_loss": null},
+            "members": [],
+            "loss_curve": [],
+            "records": [],
+            "folds": 9,
+            "running": false
+        }"#;
+        let snapshot: PopulationSnapshot =
+            serde_json::from_str(snapshot_json).expect("old snapshot reads");
+        assert_eq!(snapshot.admitted_total, 0);
+        assert_eq!(snapshot.rejected_total, 0);
+    }
+
+    #[test]
+    fn a_resumed_event_names_the_candidate_of_nothing_and_keeps_its_cycle() {
+        let event = Event::TaskResumed {
+            cycle: 3,
+            cycles_planned: 8,
+            seed: 7,
+            generator_reseeded: true,
+        };
+        assert_eq!(event.kind(), "task_resumed");
+        assert_eq!(event.cycle(), Some(3));
+        assert_eq!(event.candidate(), None);
+        assert!(event.summary().contains("re-seeded"));
+
+        let scored = Event::Scored {
+            cycle: 4,
+            candidate: CandidateId(12),
+            loss: 0.5,
+            iptm: 0.7,
+            interface_plddt: 80.0,
+        };
+        assert_eq!(scored.candidate(), Some(CandidateId(12)));
     }
 
     #[test]
