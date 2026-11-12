@@ -135,15 +135,10 @@ fn scope_view(paths: &TaskPaths) -> Option<ScopeView> {
 /// Reject anything that is not a plain directory name.
 ///
 /// Task ids reach this from a URL, so a joined path could otherwise climb out
-/// of the task root. The id must also be a directory that is actually there.
+/// of the task root. The syntax rule is [`trace::check_id`], shared with
+/// `history::load`. The id must also be a directory that is actually there.
 fn task_dir(root: &Path, id: &str) -> Option<TaskPaths> {
-    let safe = !id.is_empty()
-        && id.len() <= 128
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        && !id.starts_with('.');
-    if !safe {
+    if trace::check_id("task id", id).is_err() {
         return None;
     }
     let candidate = root.join(id);
