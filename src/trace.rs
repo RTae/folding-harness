@@ -447,6 +447,48 @@ pub fn read_json<T: DeserializeOwned>(path: impl AsRef<Path>) -> io::Result<T> {
     serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// The longest identifier accepted for a name the harness joins onto a path
+/// it owns.
+const MAX_ID_LEN: usize = 128;
+
+/// Check a user-supplied identifier that a caller will join onto a path under
+/// a root the harness owns, such as a task directory name or a chat file
+/// name.
+///
+/// Syntax only, no I/O. Whether the resulting path exists is the caller's
+/// question, and the callers answer it differently: the web view returns 404,
+/// `history::load` returns an error.
+///
+/// Accepts 1 to 128 characters of ASCII letters, digits, `-` and `_`. The
+/// allowlist rules out every traversal shape: no path separator, no dot-dot
+/// component, no leading dot, and no dot anywhere else. A dot has no
+/// legitimate use: `TaskId::new` builds `<epoch-seconds>-<slug>` where the
+/// slug maps every non-alphanumeric character to `-`, and a chat id is a
+/// millisecond timestamp, so neither ever contains one.
+///
+/// `field` names the identifier ("task id", "chat id") so the returned reason
+/// can go in front of a user as-is.
+pub fn check_id(field: &str, id: &str) -> Result<(), String> {
+    let shape =
+        format!("a {field} is 1 to {MAX_ID_LEN} characters of ASCII letters, digits, '-' and '_'");
+    if id.is_empty() {
+        return Err(format!("{field} is empty; {shape}"));
+    }
+    if id.len() > MAX_ID_LEN {
+        return Err(format!(
+            "{field} is {} characters, over the {MAX_ID_LEN} limit; {shape}",
+            id.len()
+        ));
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+    {
+        return Err(format!("{field} '{id}' contains '{bad}'; {shape}"));
+    }
+    Ok(())
+}
+
 /// Layout of one task directory.
 #[derive(Debug, Clone)]
 pub struct TaskPaths {
@@ -635,5 +677,57 @@ mod tests {
         assert_eq!(sha256_hex(b"name: demo"), sha256_hex(b"name: demo"));
         assert_ne!(sha256_hex(b"name: demo"), sha256_hex(b"name: demo2"));
         assert_eq!(sha256_hex(b"").len(), 64);
+    }
+
+    #[test]
+    fn a_traversal_id_never_passes_the_shared_check() {
+        for attempt in [
+            "..",
+            "../x",
+            "a/../b",
+            "/absolute",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "run.json.bak",
+            "",
+        ] {
+            assert!(
+                check_id("task id", attempt).is_err(),
+                "{attempt:?} should have been refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_id_length_bound_is_128_characters() {
+        assert!(check_id("task id", &"a".repeat(128)).is_ok());
+        assert!(check_id("task id", &"a".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn an_id_of_the_shape_taskid_new_builds_is_accepted() {
+        let id = crate::TaskId::new("Demo Task!").to_string();
+        // The premise for refusing dots, pinned so a change to TaskId::new
+        // that breaks it fails here rather than in the field.
+        assert!(!id.contains('.'), "{id} contains a dot");
+        assert!(check_id("task id", &id).is_ok(), "{id} was refused");
+        // A chat id is a millisecond timestamp.
+        assert!(check_id("chat id", &format!("{}", now_ms())).is_ok());
+    }
+
+    #[test]
+    fn the_refusal_names_the_field_and_says_what_to_do() {
+        let reason = check_id("chat id", "../x").expect_err("refused");
+        assert!(reason.contains("chat id"), "{reason}");
+        assert!(reason.contains("128"), "{reason}");
+
+        let reason = check_id("chat id", "").expect_err("refused");
+        assert!(reason.contains("chat id"), "{reason}");
+        assert!(reason.contains("empty"), "{reason}");
+
+        let reason = check_id("task id", &"a".repeat(129)).expect_err("refused");
+        assert!(reason.contains("task id"), "{reason}");
+        assert!(reason.contains("128"), "{reason}");
     }
 }
