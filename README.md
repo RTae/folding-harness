@@ -12,7 +12,7 @@ renders better than a terminal does.
 
 > **Status: working proof of concept.** The cycle, the contract, the gates, the
 > population, the trace, the manifest, the dashboard, the chat screen, the web
-> view and the chat history are implemented, and 188 tests pass. Count them
+> view and the chat history are implemented, and 194 tests pass. Count them
 > with `cargo test` and sum the `passed` figures in its `test result` lines.
 > `fh run` completes end to end both in-process and over HTTP, and produces
 > the identical run either way.
