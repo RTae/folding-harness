@@ -295,6 +295,39 @@ candidate rather than weighted away.
 digest and the service version, you can re-run a result and show that it used
 the same inputs. Set `FH_TASK_ROOT` to move the directory.
 
+### Resume a run
+
+`fh resume` continues a recorded run from its last completed cycle.
+
+```bash
+fh run task.yaml --cycles 4     # stops after 4 cycles, or is interrupted
+fh resume                       # continue the most recent task
+fh resume --cycles 16           # extend the planned total and continue
+fh resume --task <task-id>      # or --path <task-dir>, like fh board
+```
+
+The resumed run rebuilds the population, the per-cycle records and the
+admission counters from the task directory. It appends to `trace.jsonl` with
+the sequence numbers continuing, and candidate ids continue after the highest
+id the recorded run assigned. `run.json` gains `resumed_from_cycle` and
+`generator_reseeded`, and its `usage` reports both runs' spend.
+
+Two limits are deliberate.
+
+- **The config must match.** The resume loads the `task.yaml` saved in the
+  task directory and refuses to run when its digest is not the `config_sha256`
+  in `run.json`. Changing the gates mid-search would mix two acceptance
+  criteria in one population and one lineage, so no flag allows it. Start a
+  new task with `fh run` instead. `--cycles` extends the planned total
+  without touching the config, so extending a run is not a config change.
+- **The generator is re-seeded.** The manifest records the seed but not the
+  position in its stream, so a resumed run seeds a fresh generator and its
+  parent selection and proposals diverge from what one uninterrupted run
+  would have produced. The same config, seed and backend reproduce the same
+  trace for one uninterrupted run, but not across a resume. The
+  `task_resumed` trace event and the manifest record the re-seed rather than
+  hiding it.
+
 ## The dashboard
 
 `fh board` has five panes. **Overview** shows the loss curve, the per-cycle
@@ -499,15 +532,13 @@ Nearest first.
    rather than scored.
 3. **Inverse-folding and likelihood-guided executors**, behind the capabilities
    the router already checks.
-4. **Resume.** The trace and manifest are enough to rebuild a population and
-   continue. `TraceWriter::append` exists for it.
-5. **Prompt caching in the chat screen.** A long conversation resends its whole
+4. **Prompt caching in the chat screen.** A long conversation resends its whole
    history each turn. Caching the system prompt would cut that, and it only
    works against the first-party API.
-6. **An MCP server.** `rmcp` is the official Rust SDK, and MCP's Tasks
+5. **An MCP server.** `rmcp` is the official Rust SDK, and MCP's Tasks
    extension is a close match for this job contract. That is how the harness
    gets driven by an agent instead of only driving one.
-7. **Cost accounting.** GPU-seconds and token spend per run, which the open
+6. **Cost accounting.** GPU-seconds and token spend per run, which the open
    harnesses in this space generally do not surface.
 
 ## Licence

@@ -14,6 +14,12 @@
 //! Steps 1–4 and 6–8 are deterministic given the task seed. Step 5 is the only
 //! one that leaves the process. That separation is what makes a run replayable:
 //! the same config, seed and backend produce the same trace.
+//!
+//! A resumed run is the one exception. The manifest records the seed but not
+//! the position in the generator's stream, so [`Orchestrator::resume`] seeds a
+//! fresh generator and the resumed run's parent selection and proposals
+//! diverge from what one uninterrupted run would have produced. The trace and
+//! the manifest both record the resume and the re-seed rather than hiding it.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -55,6 +61,29 @@ pub enum RunError {
     NoExecutor { skill: String },
     #[error("the founder sequence could not be folded: {0}")]
     FounderFoldFailed(String),
+    #[error("no run.json in {dir}; `fh resume` continues a recorded run, so point --path at a task directory that `fh run` created")]
+    NoManifest { dir: std::path::PathBuf },
+    #[error("no population.json in {dir}; the recorded run left no population to continue, so run the task again with `fh run`")]
+    NoSnapshot { dir: std::path::PathBuf },
+    #[error("population.json in {dir} retains no members, so there is no parent to design from; run the task again with `fh run`")]
+    EmptySnapshot { dir: std::path::PathBuf },
+    #[error("the run in {dir} already completed its {completed} planned cycles; pass --cycles with a larger total to extend it")]
+    AlreadyComplete {
+        dir: std::path::PathBuf,
+        completed: u32,
+    },
+    #[error("--cycles {requested} is below the {completed} cycles already completed in {dir}; pass a larger total to extend the run")]
+    CyclesBelowCompleted {
+        dir: std::path::PathBuf,
+        completed: u32,
+        requested: u32,
+    },
+    #[error("the config does not match the recorded run: {path} digests to {current}, but run.json beside it records {recorded}. A resumed run continues one search, so it needs the config that search used. Resume from the task.yaml saved in the task directory, or start a new task with `fh run`.")]
+    ConfigMismatch {
+        path: std::path::PathBuf,
+        recorded: String,
+        current: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +117,14 @@ pub struct Orchestrator {
     next_id: u32,
     folds: usize,
     meter: crate::usage::Meter,
+    /// What the recorded run spent before a resume. Added to the meter's
+    /// snapshot so `run.json` reports both runs' spend.
+    usage_base: crate::usage::Usage,
+    /// The first cycle `run` executes. One for a fresh run, one past the
+    /// recorded run's last completed cycle for a resume.
+    start_cycle: u32,
+    /// The cycle a resumed run continues from, for the `TaskResumed` event.
+    resumed_from: Option<u32>,
     on_event: Option<EventSink>,
 }
 
@@ -135,6 +172,8 @@ impl Orchestrator {
             best_loss: None,
             chat_id: None,
             usage: crate::usage::Usage::default(),
+            resumed_from_cycle: None,
+            generator_reseeded: false,
         };
         crate::trace::write_json(paths.manifest(), &manifest)?;
 
@@ -159,6 +198,149 @@ impl Orchestrator {
             next_id: 0,
             folds: 0,
             meter: crate::usage::Meter::new(),
+            usage_base: crate::usage::Usage::default(),
+            start_cycle: 1,
+            resumed_from: None,
+            on_event: None,
+        })
+    }
+
+    /// Rebuild the search state from a task directory a recorded run left, so
+    /// [`run`](Self::run) continues from the last completed cycle.
+    ///
+    /// The config must digest to the `config_sha256` the manifest recorded, or
+    /// two searches would mix into one population and one lineage. `cycles_total`
+    /// extends the planned total past what the config says; the digest is
+    /// checked before it applies, so extending a run is not a config change.
+    ///
+    /// The generator cannot be restored: the manifest records the seed but not
+    /// the position in its stream. This re-seeds from `design.seed`, and the
+    /// manifest, the trace and `run.json` say so.
+    pub async fn resume(
+        mut config: TaskConfig,
+        backend: Arc<dyn FoldBackend>,
+        agent: Box<dyn DesignAgent>,
+        paths: TaskPaths,
+        cycles_total: Option<u32>,
+    ) -> Result<Self, RunError> {
+        let dir = paths.root().to_path_buf();
+        let mut manifest: RunManifest = crate::trace::read_json(paths.manifest())
+            .map_err(|_| RunError::NoManifest { dir: dir.clone() })?;
+        let snapshot: PopulationSnapshot = crate::trace::read_json(paths.population())
+            .map_err(|_| RunError::NoSnapshot { dir: dir.clone() })?;
+
+        let config_yaml = config.to_yaml()?;
+        let digest = crate::trace::sha256_hex(config_yaml.as_bytes());
+        if digest != manifest.config_sha256 {
+            return Err(RunError::ConfigMismatch {
+                path: paths.config(),
+                recorded: manifest.config_sha256.clone(),
+                current: digest,
+            });
+        }
+
+        // population.json is written after every completed cycle, so its
+        // `cycle` is the completed count even when the run stopped before it
+        // could write a final run.json.
+        let completed = snapshot.cycle;
+        match cycles_total {
+            Some(total) if total < completed => {
+                return Err(RunError::CyclesBelowCompleted {
+                    dir,
+                    completed,
+                    requested: total,
+                })
+            }
+            Some(total) => config.design.cycles = total,
+            None => {}
+        }
+        if completed >= config.design.cycles {
+            return Err(RunError::AlreadyComplete { dir, completed });
+        }
+        if snapshot.members.is_empty() {
+            return Err(RunError::EmptySnapshot { dir });
+        }
+
+        let (scaffold, scope) = config.resolve()?;
+        let health = backend.health().await?;
+        let router = Router::from_capability_strings(
+            config.design.skills.iter().copied(),
+            &health.capabilities,
+        );
+
+        let (admitted, rejected) = if snapshot.admitted_total > 0 || snapshot.rejected_total > 0 {
+            (snapshot.admitted_total, snapshot.rejected_total)
+        } else {
+            // A snapshot written before the counters were recorded carries
+            // only the cycle records. The founder is the extra admission.
+            // The rebuilt `rejected` also counts gate failures and fold
+            // failures, which the population's own counter never saw, so it
+            // is higher than the recorded run reported.
+            (
+                1 + snapshot.records.iter().map(|r| r.admitted).sum::<usize>(),
+                snapshot.records.iter().map(|r| r.rejected).sum(),
+            )
+        };
+        let population = Population::restore(
+            config.population.clone(),
+            snapshot.members.clone(),
+            admitted,
+            rejected,
+        );
+        let history = SearchHistory::restore(snapshot.records.clone());
+
+        // Ids continue after the highest one the recorded run ever assigned,
+        // not just the retained ones: a collision would silently overwrite a
+        // candidate and corrupt the lineage. The trace names every candidate
+        // it folded, admitted or rejected. `read_all` skips a half-written
+        // last line, but `fold_all` writes `FoldStarted` for a whole batch
+        // before any later event, so the highest id stays readable.
+        let next_id = crate::trace::read_all(paths.trace())?
+            .iter()
+            .filter_map(|record| record.event.candidate())
+            .map(|id| id.0)
+            .chain(snapshot.members.iter().map(|member| member.id.0))
+            .max()
+            .unwrap_or(0);
+
+        let trace = TraceWriter::append(paths.trace())?;
+
+        let usage_base = manifest.usage;
+        manifest.harness_version = env!("CARGO_PKG_VERSION").to_string();
+        manifest.finished_at_ms = None;
+        manifest.protocol = health.protocol.clone();
+        manifest.service_version = Some(health.version.clone());
+        manifest.cycles_planned = config.design.cycles;
+        manifest.cycles_completed = completed;
+        manifest.folds = snapshot.folds;
+        manifest.resumed_from_cycle = Some(completed);
+        manifest.generator_reseeded = true;
+
+        paths.ensure()?;
+        crate::trace::write_json(paths.manifest(), &manifest)?;
+
+        let rng = crate::rng_from_seed(config.design.seed);
+        let task_id = TaskId(manifest.task_id.clone());
+        Ok(Orchestrator {
+            config,
+            scaffold,
+            scope,
+            population,
+            history,
+            backend,
+            agent,
+            router,
+            trace,
+            paths,
+            manifest,
+            rng,
+            task_id,
+            next_id,
+            folds: snapshot.folds,
+            meter: crate::usage::Meter::new(),
+            usage_base,
+            start_cycle: completed + 1,
+            resumed_from: Some(completed),
             on_event: None,
         })
     }
@@ -192,6 +374,14 @@ impl Orchestrator {
     fn save_manifest(&self) -> Result<(), RunError> {
         crate::trace::write_json(self.paths.manifest(), &self.manifest)?;
         Ok(())
+    }
+
+    /// Persist the counters a later resume reads back: folds and the spend of
+    /// this run added to what the recorded run spent.
+    fn record_progress(&mut self) -> Result<(), RunError> {
+        self.manifest.folds = self.folds;
+        self.manifest.usage = self.usage_base.summed_with(self.meter.snapshot());
+        self.save_manifest()
     }
 
     fn emit(&mut self, event: Event) -> Result<(), RunError> {
@@ -255,26 +445,41 @@ impl Orchestrator {
         let started = Instant::now();
         self.announce()?;
 
-        match self.seed_founder().await {
-            Ok(()) => {}
-            Err(error) => {
-                self.emit(Event::TaskFailed {
-                    cycle: 0,
-                    detail: error.to_string(),
+        match self.resumed_from {
+            // A resumed run keeps the population and the history the recorded
+            // run left, so it does not seed a founder again.
+            Some(cycle) => {
+                self.emit(Event::TaskResumed {
+                    cycle,
+                    cycles_planned: self.config.design.cycles,
+                    seed: self.config.design.seed,
+                    generator_reseeded: true,
                 })?;
-                return Err(error);
             }
+            None => match self.seed_founder().await {
+                Ok(()) => {}
+                Err(error) => {
+                    self.emit(Event::TaskFailed {
+                        cycle: 0,
+                        detail: error.to_string(),
+                    })?;
+                    self.record_progress()?;
+                    return Err(error);
+                }
+            },
         }
 
-        for cycle in 1..=self.config.design.cycles {
+        for cycle in self.start_cycle..=self.config.design.cycles {
             if let Err(error) = self.run_cycle(cycle).await {
                 self.emit(Event::TaskFailed {
                     cycle,
                     detail: error.to_string(),
                 })?;
+                self.record_progress()?;
                 return Err(error);
             }
             self.manifest.cycles_completed = cycle;
+            self.record_progress()?;
             self.snapshot(cycle, true)?;
         }
 
@@ -290,11 +495,9 @@ impl Orchestrator {
         })?;
 
         self.manifest.finished_at_ms = Some(now_ms());
-        self.manifest.folds = self.folds;
-        self.manifest.usage = self.meter.snapshot();
         self.manifest.best_candidate = best.as_ref().map(|candidate| candidate.id);
         self.manifest.best_loss = best.as_ref().and_then(|candidate| candidate.loss);
-        self.save_manifest()?;
+        self.record_progress()?;
         self.snapshot(self.manifest.cycles_completed, false)?;
 
         Ok(RunSummary {
@@ -725,6 +928,8 @@ impl Orchestrator {
             records: self.history.records().to_vec(),
             folds: self.folds,
             running,
+            admitted_total: self.population.admitted_total(),
+            rejected_total: self.population.rejected_total(),
         };
         crate::trace::write_json(self.paths.population(), &snapshot)?;
         if let Some(best) = self.population.best() {
@@ -859,33 +1064,76 @@ fold:
         (summary, members, scaffold)
     }
 
-    /// The property the whole harness exists to guarantee, checked against a
-    /// finished run rather than a single call: after eight cycles of mutation
-    /// and whole-region redesign, every residue outside the mutable scope is
-    /// still exactly what the config said it was.
-    #[tokio::test]
-    async fn no_run_ever_changes_a_position_outside_the_mutable_scope() {
-        let dir = temp_dir("invariant");
-        let (summary, members, scaffold) = run_once(&dir, 4242).await;
+    /// Run a fresh task for `cycles` cycles in `dir`, leaving the artifacts a
+    /// resume reads back.
+    async fn run_stopped(dir: &std::path::Path, seed: u64, cycles: u32) -> RunSummary {
+        let mut config = TaskConfig::from_yaml(YAML).expect("config parses");
+        config.design.seed = seed;
+        config.design.cycles = cycles;
+        let (scaffold, scope) = config.resolve().expect("resolves");
 
-        assert_eq!(summary.cycles_completed, 8);
-        assert!(
-            summary.folds > 8,
-            "expected real folding, got {}",
-            summary.folds
-        );
-        assert!(members.len() > 1, "nothing was admitted");
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, seed));
+        let mut orchestrator = Orchestrator::prepare(
+            config,
+            backend,
+            Box::new(HeuristicAgent::new(seed)),
+            crate::trace::TaskPaths::new(dir),
+            TaskId("test".to_string()),
+        )
+        .await
+        .expect("prepares");
+        orchestrator.run().await.expect("runs")
+    }
 
-        let config = TaskConfig::from_yaml(YAML).expect("config parses");
-        let (_, scope) = config.resolve().expect("resolves");
+    /// Resume the task in `dir` and extend it to `total` cycles, loading the
+    /// config back from the recorded task.yaml the way `fh resume` does.
+    async fn run_resumed(
+        dir: &std::path::Path,
+        seed: u64,
+        total: u32,
+    ) -> (RunSummary, Orchestrator) {
+        let paths = crate::trace::TaskPaths::new(dir);
+        let config = TaskConfig::load(paths.config()).expect("recorded config loads");
+        let (scaffold, scope) = config.resolve().expect("resolves");
 
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, seed));
+        let mut orchestrator = Orchestrator::resume(
+            config,
+            backend,
+            Box::new(HeuristicAgent::new(seed)),
+            paths,
+            Some(total),
+        )
+        .await
+        .expect("resumes");
+        let summary = orchestrator.run().await.expect("runs");
+        (summary, orchestrator)
+    }
+
+    /// Unwrap the error of a refused resume. `Orchestrator` has no `Debug`,
+    /// so `expect_err` cannot be used on the result.
+    fn resume_error(result: Result<Orchestrator, RunError>) -> RunError {
+        match result {
+            Ok(_) => panic!("the resume must be refused"),
+            Err(error) => error,
+        }
+    }
+
+    /// The position check the invariant tests pin: every residue outside the
+    /// mutable scope is still exactly what the config said it was, including
+    /// the explicitly pinned residue inside a mutable region.
+    fn assert_positions_untouched(
+        members: &[Candidate],
+        scaffold: &Scaffold,
+        scope: &MutableScope,
+    ) {
         for chain in scaffold
             .chains
             .iter()
             .filter(|c| c.role == ChainRole::Binder)
         {
             let founder: Vec<char> = chain.sequence.chars().collect();
-            for member in &members {
+            for member in members {
                 let current: Vec<char> = member
                     .sequence
                     .chain(chain.id)
@@ -914,6 +1162,290 @@ fold:
                     member.id
                 );
             }
+        }
+    }
+
+    /// The property the whole harness exists to guarantee, checked against a
+    /// finished run rather than a single call: after eight cycles of mutation
+    /// and whole-region redesign, every residue outside the mutable scope is
+    /// still exactly what the config said it was.
+    #[tokio::test]
+    async fn no_run_ever_changes_a_position_outside_the_mutable_scope() {
+        let dir = temp_dir("invariant");
+        let (summary, members, scaffold) = run_once(&dir, 4242).await;
+
+        assert_eq!(summary.cycles_completed, 8);
+        assert!(
+            summary.folds > 8,
+            "expected real folding, got {}",
+            summary.folds
+        );
+        assert!(members.len() > 1, "nothing was admitted");
+
+        let config = TaskConfig::from_yaml(YAML).expect("config parses");
+        let (_, scope) = config.resolve().expect("resolves");
+
+        assert_positions_untouched(&members, &scaffold, &scope);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same invariant across a resume: the restored population and four
+    /// more cycles of mutation must not touch a position outside the scope.
+    #[tokio::test]
+    async fn a_resumed_run_also_keeps_every_position_outside_the_mutable_scope() {
+        let dir = temp_dir("resume-invariant");
+        run_stopped(&dir, 4242, 4).await;
+        let (summary, orchestrator) = run_resumed(&dir, 4242, 8).await;
+
+        assert_eq!(summary.cycles_completed, 8);
+        assert!(
+            summary.folds > 8,
+            "expected real folding across both runs, got {}",
+            summary.folds
+        );
+        let members = orchestrator.population().members().to_vec();
+        assert!(members.len() > 1, "nothing was admitted");
+
+        let config = TaskConfig::from_yaml(YAML).expect("config parses");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+        assert_positions_untouched(&members, &scaffold, &scope);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_run_stopped_early_resumes_from_the_recorded_population() {
+        let dir = temp_dir("resume-basic");
+        run_stopped(&dir, 4242, 3).await;
+
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let before: crate::trace::PopulationSnapshot =
+            crate::trace::read_json(paths.population()).expect("snapshot reads");
+        assert_eq!(before.cycle, 3);
+        assert_eq!(before.records.len(), 3);
+        assert!(!before.members.is_empty());
+
+        // The restored population is the recorded one, member for member,
+        // before a single new cycle runs.
+        let config = TaskConfig::load(paths.config()).expect("recorded config loads");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 4242));
+        let mut orchestrator = Orchestrator::resume(
+            config,
+            backend,
+            Box::new(HeuristicAgent::new(4242)),
+            paths.clone(),
+            Some(8),
+        )
+        .await
+        .expect("resumes");
+        assert_eq!(orchestrator.population().members(), &before.members[..]);
+
+        let summary = orchestrator.run().await.expect("runs");
+        assert_eq!(summary.cycles_completed, 8);
+
+        let after: crate::trace::PopulationSnapshot =
+            crate::trace::read_json(paths.population()).expect("snapshot reads");
+        assert_eq!(after.records.len(), 8);
+        assert_eq!(&after.records[..3], &before.records[..]);
+        assert!(!after.running);
+
+        let manifest: RunManifest =
+            crate::trace::read_json(paths.manifest()).expect("manifest reads");
+        assert_eq!(manifest.cycles_completed, 8);
+        assert_eq!(manifest.cycles_planned, 8);
+        assert_eq!(manifest.resumed_from_cycle, Some(3));
+        assert!(manifest.generator_reseeded);
+        assert_eq!(manifest.folds, summary.folds);
+        assert!(manifest.finished_at_ms.is_some());
+        assert_eq!(manifest.best_candidate, summary.best.as_ref().map(|c| c.id));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn candidate_ids_after_a_resume_do_not_collide_with_ids_before_it() {
+        let dir = temp_dir("resume-ids");
+        run_stopped(&dir, 11, 3).await;
+
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let before = crate::trace::read_all(paths.trace()).expect("trace reads");
+        let highest_before = before
+            .iter()
+            .filter_map(|record| record.event.candidate())
+            .map(|id| id.0)
+            .max()
+            .expect("the founder was folded");
+
+        run_resumed(&dir, 11, 8).await;
+
+        let after = crate::trace::read_all(paths.trace()).expect("trace reads");
+        let resumed_at = after
+            .iter()
+            .position(|record| matches!(record.event, Event::TaskResumed { .. }))
+            .expect("the resume is recorded");
+        let new_ids: Vec<u32> = after[resumed_at..]
+            .iter()
+            .filter_map(|record| record.event.candidate())
+            .map(|id| id.0)
+            .collect();
+        assert!(!new_ids.is_empty(), "the resumed run folded nothing");
+        assert!(
+            new_ids.iter().all(|id| *id > highest_before),
+            "an id after the resume reuses a recorded candidate: {new_ids:?} vs {highest_before}"
+        );
+
+        let snapshot: crate::trace::PopulationSnapshot =
+            crate::trace::read_json(paths.population()).expect("snapshot reads");
+        let mut ids: Vec<u32> = snapshot.members.iter().map(|member| member.id.0).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "two retained members share an id");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_resumed_trace_keeps_the_earlier_records_and_continues_the_numbering() {
+        let dir = temp_dir("resume-trace");
+        run_stopped(&dir, 5, 2).await;
+
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let before = crate::trace::read_all(paths.trace()).expect("trace reads");
+        assert!(matches!(
+            before.last().map(|record| &record.event),
+            Some(Event::TaskFinished { .. })
+        ));
+
+        run_resumed(&dir, 5, 6).await;
+
+        let after = crate::trace::read_all(paths.trace()).expect("trace reads");
+        assert!(after.len() > before.len());
+        assert_eq!(
+            &after[..before.len()],
+            &before[..],
+            "the earlier records must survive untouched"
+        );
+        for (index, record) in after.iter().enumerate() {
+            assert_eq!(record.seq, index as u64 + 1, "sequence numbers stay dense");
+        }
+        assert!(matches!(
+            &after[before.len()].event,
+            Event::TaskStarted { .. }
+        ));
+        assert!(matches!(
+            &after[before.len() + 1].event,
+            Event::TaskResumed {
+                cycle: 2,
+                generator_reseeded: true,
+                ..
+            }
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_config_that_does_not_match_the_recorded_digest_is_refused() {
+        let dir = temp_dir("resume-mismatch");
+        run_stopped(&dir, 3, 2).await;
+
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let mut config = TaskConfig::load(paths.config()).expect("recorded config loads");
+        config.gates.min_iptm += 0.05;
+        let (scaffold, scope) = config.resolve().expect("resolves");
+
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 3));
+        let error = resume_error(
+            Orchestrator::resume(
+                config,
+                backend,
+                Box::new(HeuristicAgent::new(3)),
+                paths.clone(),
+                None,
+            )
+            .await,
+        );
+
+        match &error {
+            RunError::ConfigMismatch {
+                path,
+                recorded,
+                current,
+            } => {
+                assert_eq!(*path, paths.config());
+                assert_ne!(recorded, current);
+                let message = error.to_string();
+                assert!(message.contains("task.yaml"), "{message}");
+                assert!(
+                    message.contains(recorded.as_str()),
+                    "the refusal must name the recorded digest: {message}"
+                );
+                assert!(
+                    message.contains(current.as_str()),
+                    "the refusal must name the digest it found: {message}"
+                );
+            }
+            other => panic!("expected a config mismatch, got {other:?}"),
+        }
+
+        // The refusal wrote no resume event into the recorded trace.
+        let records = crate::trace::read_all(paths.trace()).expect("trace reads");
+        assert!(!records
+            .iter()
+            .any(|record| matches!(record.event, Event::TaskResumed { .. })));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_refuses_a_resume_that_does_not_extend_it() {
+        let dir = temp_dir("resume-done");
+        run_stopped(&dir, 2, 3).await;
+
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let config = TaskConfig::load(paths.config()).expect("recorded config loads");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 2));
+        let error = resume_error(
+            Orchestrator::resume(
+                config.clone(),
+                backend,
+                Box::new(HeuristicAgent::new(2)),
+                paths.clone(),
+                None,
+            )
+            .await,
+        );
+        assert!(
+            matches!(error, RunError::AlreadyComplete { completed: 3, .. }),
+            "{error:?}"
+        );
+
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 2));
+        let error = resume_error(
+            Orchestrator::resume(
+                config,
+                backend,
+                Box::new(HeuristicAgent::new(2)),
+                paths.clone(),
+                Some(2),
+            )
+            .await,
+        );
+        match error {
+            RunError::CyclesBelowCompleted {
+                completed,
+                requested,
+                ..
+            } => {
+                assert_eq!(completed, 3);
+                assert_eq!(requested, 2);
+            }
+            other => panic!("expected a cycles refusal, got {other:?}"),
         }
 
         std::fs::remove_dir_all(&dir).ok();

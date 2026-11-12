@@ -115,6 +115,26 @@ pub enum Command {
         #[arg(long, default_value_t = 0)]
         latency_ms: u64,
     },
+    /// Continue a recorded run from where it stopped.
+    Resume {
+        /// Task directory. Defaults to the most recent task.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Task id under the default task root.
+        #[arg(long)]
+        task: Option<String>,
+        /// Extend the planned total cycles. Must be above the cycles already
+        /// completed. The config comes from the task.yaml saved in the task
+        /// directory and must match the digest run.json recorded.
+        #[arg(long)]
+        cycles: Option<u32>,
+        /// Open the dashboard instead of streaming events to stdout.
+        #[arg(long)]
+        board: bool,
+        /// Artificial per-fold delay for the fixture backend, to watch a run.
+        #[arg(long, default_value_t = 0)]
+        latency_ms: u64,
+    },
     /// Chat with a model to set up a run, see the validated plan, then confirm.
     Chat {
         /// Binder chain: a FASTA path, or a bare sequence. Repeatable.
@@ -333,6 +353,13 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Command::Resume {
+            path,
+            task,
+            cycles,
+            board,
+            latency_ms,
+        } => run::resume(path, task, cycles, board, Duration::from_millis(latency_ms)).await,
         Command::Chat {
             binder,
             target,
