@@ -475,6 +475,16 @@ pub struct RunManifest {
     /// choices after the resume diverge from one uninterrupted run.
     #[serde(default)]
     pub generator_reseeded: bool,
+    /// The protocol the resumed run's health check reported. `protocol` and
+    /// `service_version` keep describing the run that produced the recorded
+    /// artifacts, while `folds`, `usage` and `best_candidate` span both runs,
+    /// so the resumed run's service identity is recorded beside them rather
+    /// than written over them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_protocol: Option<String>,
+    /// The service version the resumed run's health check reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_service_version: Option<String>,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -759,6 +769,8 @@ mod tests {
             serde_json::from_str(manifest_json).expect("old manifest reads");
         assert_eq!(manifest.resumed_from_cycle, None);
         assert!(!manifest.generator_reseeded);
+        assert_eq!(manifest.resumed_protocol, None);
+        assert_eq!(manifest.resumed_service_version, None);
         assert!(manifest.usage.is_empty());
         assert!(manifest.chat_id.is_none());
 

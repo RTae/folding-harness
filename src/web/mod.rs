@@ -388,6 +388,78 @@ mod tests {
         }
     }
 
+    /// Every event kind the trace can record has a case in the script's
+    /// `summarise`, or the event pane renders it blank: a kind chip with no
+    /// text. Both files compile into the binary, so this is checked at build
+    /// time rather than discovered in a browser. The kinds in `BLANK` may
+    /// render with no text, because the chip alone says enough for them.
+    #[test]
+    fn every_event_kind_the_trace_records_has_a_case_in_the_script() {
+        const BLANK: &[&str] = &["fold_started", "fold_finished"];
+
+        // The kinds Rust emits: the string literals in the `Event::kind()`
+        // match in src/trace.rs. Both files are in this crate, so the source
+        // is available to the test.
+        const TRACE_SOURCE: &str = include_str!("../trace.rs");
+        let after_signature = TRACE_SOURCE
+            .split_once("pub fn kind(&self) -> &'static str")
+            .expect("trace.rs defines Event::kind")
+            .1;
+        let kind_body = after_signature
+            .split_once("\n    }\n")
+            .expect("Event::kind ends")
+            .0;
+        let mut rust_kinds: Vec<&str> = Vec::new();
+        let mut rest = kind_body;
+        while let Some(at) = rest.find("=> \"") {
+            rest = &rest[at + 4..];
+            if let Some(end) = rest.find('"') {
+                rust_kinds.push(&rest[..end]);
+                rest = &rest[end..];
+            }
+        }
+        assert!(
+            rust_kinds.len() >= 15,
+            "found only {} kinds in Event::kind, the parse broke",
+            rust_kinds.len()
+        );
+
+        // The kinds the script summarises: the `case` labels inside
+        // `summarise`. The scan stays inside that function, because the
+        // script has other switches whose labels are not event kinds.
+        let summarise = SCRIPT
+            .split_once("function summarise(")
+            .expect("the script defines summarise")
+            .1;
+        let summarise_body = summarise.split_once("\n}\n").expect("summarise ends").0;
+        let mut script_cases: Vec<&str> = Vec::new();
+        let mut rest = summarise_body;
+        while let Some(at) = rest.find("case \"") {
+            rest = &rest[at + 6..];
+            if let Some(end) = rest.find('"') {
+                script_cases.push(&rest[..end]);
+                rest = &rest[end..];
+            }
+        }
+        assert!(
+            !script_cases.is_empty(),
+            "found no cases in summarise, the parse broke"
+        );
+
+        for kind in &rust_kinds {
+            assert!(
+                script_cases.contains(kind) || BLANK.contains(kind),
+                "the event pane renders '{kind}' blank: summarise in app.js has no case for it"
+            );
+        }
+        for case in &script_cases {
+            assert!(
+                rust_kinds.contains(case),
+                "summarise in app.js has a case for '{case}', which the trace never records"
+            );
+        }
+    }
+
     /// A run the picker can show. `runs` skips a task directory whose
     /// `run.json` is missing or unreadable, so the list stays empty without
     /// this.
@@ -413,6 +485,8 @@ mod tests {
             usage: Default::default(),
             resumed_from_cycle: None,
             generator_reseeded: false,
+            resumed_protocol: None,
+            resumed_service_version: None,
         };
         let encoded = serde_json::to_vec(&manifest).expect("encode manifest");
         std::fs::write(paths.manifest(), encoded).expect("write manifest");

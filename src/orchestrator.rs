@@ -66,12 +66,24 @@ pub enum RunError {
     FounderFoldFailed(String),
     #[error("there is no founder to design from. {reason}. Check the service against the contract in src/contract.rs")]
     FounderSequenceMismatch { reason: String },
-    #[error("no run.json in {dir}; `fh resume` continues a recorded run, so point --path at a task directory that `fh run` created")]
-    NoManifest { dir: std::path::PathBuf },
-    #[error("no population.json in {dir}; the recorded run left no population to continue, so run the task again with `fh run`")]
-    NoSnapshot { dir: std::path::PathBuf },
+    #[error("cannot read run.json in {dir}: {detail}. `fh resume` continues a recorded run, so point --path at a task directory that `fh run` created")]
+    NoManifest {
+        dir: std::path::PathBuf,
+        detail: String,
+    },
+    #[error("cannot read population.json in {dir}: {detail}. A resume continues the population the recorded run retained, so run the task again with `fh run`")]
+    NoSnapshot {
+        dir: std::path::PathBuf,
+        detail: String,
+    },
     #[error("population.json in {dir} retains no members, so there is no parent to design from; run the task again with `fh run`")]
     EmptySnapshot { dir: std::path::PathBuf },
+    #[error("population.json in {dir} holds candidate {candidate}, which the recorded run could not have produced: {reason}. A resume folds the members it restores, so restore population.json from a copy the recorded run wrote, or run the task again with `fh run`")]
+    SnapshotMemberInvalid {
+        dir: std::path::PathBuf,
+        candidate: CandidateId,
+        reason: String,
+    },
     #[error("the run in {dir} already completed its {completed} planned cycles; pass --cycles with a larger total to extend it")]
     AlreadyComplete {
         dir: std::path::PathBuf,
@@ -179,6 +191,8 @@ impl Orchestrator {
             usage: crate::usage::Usage::default(),
             resumed_from_cycle: None,
             generator_reseeded: false,
+            resumed_protocol: None,
+            resumed_service_version: None,
         };
         crate::trace::write_json(paths.manifest(), &manifest)?;
 
@@ -229,10 +243,16 @@ impl Orchestrator {
         cycles_total: Option<u32>,
     ) -> Result<Self, RunError> {
         let dir = paths.root().to_path_buf();
-        let mut manifest: RunManifest = crate::trace::read_json(paths.manifest())
-            .map_err(|_| RunError::NoManifest { dir: dir.clone() })?;
-        let snapshot: PopulationSnapshot = crate::trace::read_json(paths.population())
-            .map_err(|_| RunError::NoSnapshot { dir: dir.clone() })?;
+        let mut manifest: RunManifest =
+            crate::trace::read_json(paths.manifest()).map_err(|error| RunError::NoManifest {
+                dir: dir.clone(),
+                detail: error.to_string(),
+            })?;
+        let snapshot: PopulationSnapshot =
+            crate::trace::read_json(paths.population()).map_err(|error| RunError::NoSnapshot {
+                dir: dir.clone(),
+                detail: error.to_string(),
+            })?;
 
         let config_yaml = config.to_yaml()?;
         let digest = crate::trace::sha256_hex(config_yaml.as_bytes());
@@ -257,7 +277,11 @@ impl Orchestrator {
                 })
             }
             Some(total) => config.design.cycles = total,
-            None => {}
+            // A resume that was killed leaves a manifest whose
+            // `cycles_planned` is larger than the config's own count, so a
+            // bare resume continues that plan rather than report the run
+            // complete against a total the manifest does not carry.
+            None => config.design.cycles = config.design.cycles.max(manifest.cycles_planned),
         }
         if completed >= config.design.cycles {
             return Err(RunError::AlreadyComplete { dir, completed });
@@ -267,6 +291,39 @@ impl Orchestrator {
         }
 
         let (scaffold, scope) = config.resolve()?;
+
+        // A resume makes the snapshot's members live: they are selected as
+        // parents, and `job_spec_for` folds their chains. `Candidate` and
+        // `BinderSequence` both deserialize, so a hand-edited or truncated
+        // population.json parses, and without this check it could smuggle a
+        // sequence past the invariant that `propose` and `from_proposal`
+        // otherwise carry. Every member the recorded run retained was folded,
+        // scored and traced, so each one is checked against the config that
+        // produced it and the trace that recorded it, and the whole resume is
+        // refused on the first defect.
+        let records = crate::trace::read_all(paths.trace())?;
+        let scored_losses: std::collections::HashMap<CandidateId, f64> = records
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::Scored {
+                    candidate, loss, ..
+                }
+                | Event::FounderScored { candidate, loss } => Some((*candidate, *loss)),
+                _ => None,
+            })
+            .collect();
+        for member in &snapshot.members {
+            if let Some(reason) =
+                restored_member_defect(member, &scaffold, &scope, &config.loss, &scored_losses)
+            {
+                return Err(RunError::SnapshotMemberInvalid {
+                    dir,
+                    candidate: member.id,
+                    reason,
+                });
+            }
+        }
+
         let health = backend.health().await?;
         let router = Router::from_capability_strings(
             config.design.skills.iter().copied(),
@@ -300,7 +357,7 @@ impl Orchestrator {
         // it folded, admitted or rejected. `read_all` skips a half-written
         // last line, but `fold_all` writes `FoldStarted` for a whole batch
         // before any later event, so the highest id stays readable.
-        let next_id = crate::trace::read_all(paths.trace())?
+        let next_id = records
             .iter()
             .filter_map(|record| record.event.candidate())
             .map(|id| id.0)
@@ -313,8 +370,13 @@ impl Orchestrator {
         let usage_base = manifest.usage;
         manifest.harness_version = env!("CARGO_PKG_VERSION").to_string();
         manifest.finished_at_ms = None;
-        manifest.protocol = health.protocol.clone();
-        manifest.service_version = Some(health.version.clone());
+        // `protocol` and `service_version` keep describing the run that
+        // produced the recorded artifacts: `folds`, `usage` and
+        // `best_candidate` span both runs, so overwriting them would name,
+        // for the whole result, a service that produced only part of it. The
+        // resumed run's own values go in the resume fields.
+        manifest.resumed_protocol = Some(health.protocol.clone());
+        manifest.resumed_service_version = Some(health.version.clone());
         manifest.cycles_planned = config.design.cycles;
         manifest.cycles_completed = completed;
         manifest.folds = snapshot.folds;
@@ -433,12 +495,19 @@ impl Orchestrator {
     }
 
     fn announce(&mut self) -> Result<(), RunError> {
+        // The event describes the service this run talks to. On a resume that
+        // is the resumed run's checked protocol, not the recorded run's.
+        let protocol = self
+            .manifest
+            .resumed_protocol
+            .clone()
+            .unwrap_or_else(|| self.manifest.protocol.clone());
         self.emit(Event::TaskStarted {
             task_id: self.task_id.0.clone(),
             name: self.config.name.clone(),
             backend: self.backend.name().to_string(),
             model: self.config.fold.model.clone(),
-            protocol: self.manifest.protocol.clone(),
+            protocol,
             cycles: self.config.design.cycles,
             seed: self.config.design.seed,
             scope: self.scope.summary(),
@@ -1047,6 +1116,105 @@ fn describe_substitutions(candidate: &Candidate, parent: &Candidate) -> String {
 /// Convenience for the `Legality` of each skill, for `fh validate`.
 pub fn routing_table(router: &Router, state: &crate::SearchState) -> Vec<(SkillId, Legality)> {
     router.assess_all(state)
+}
+
+/// What one member of a `population.json` must look like to have come from a
+/// recorded run of this config: the scaffold's binder chains at the scaffold's
+/// lengths, the config's residue at every position outside the mutable scope,
+/// and the loss its own metrics and trace produce. Returns why the member
+/// could not have been recorded, or `None` when it passes. `scored` maps a
+/// candidate id to the loss its `Scored` or `FounderScored` event recorded.
+///
+/// Pure function, no I/O: the caller parses the snapshot and the trace and
+/// passes the values in, the way `Population::restore` takes them.
+fn restored_member_defect(
+    member: &Candidate,
+    scaffold: &Scaffold,
+    scope: &MutableScope,
+    weights: &crate::LossWeights,
+    scored: &std::collections::HashMap<CandidateId, f64>,
+) -> Option<String> {
+    let binders: Vec<&crate::scaffold::Chain> = scaffold.binder_chains().collect();
+
+    let extras: Vec<String> = member
+        .sequence
+        .iter()
+        .map(|(id, _)| id)
+        .filter(|id| !binders.iter().any(|chain| chain.id == *id))
+        .map(|id| id.to_string())
+        .collect();
+    if !extras.is_empty() {
+        return Some(format!(
+            "it carries {}, which the config's binder does not have",
+            extras.join(", ")
+        ));
+    }
+
+    for chain in &binders {
+        let Some(sequence) = member.sequence.chain(chain.id) else {
+            return Some(format!(
+                "it has no chain {}, which the config's binder has",
+                chain.label
+            ));
+        };
+        let found = sequence.chars().count();
+        if found != chain.len() {
+            return Some(format!(
+                "its chain {} is {found} residues long, but the config says {}",
+                chain.label,
+                chain.len()
+            ));
+        }
+    }
+
+    for chain in &binders {
+        let configured: Vec<char> = chain.sequence.chars().collect();
+        let current: Vec<char> = member
+            .sequence
+            .chain(chain.id)
+            .expect("the chain check above passed")
+            .chars()
+            .collect();
+        for position in 0..configured.len() {
+            if !scope.is_mutable(chain.id, position) && current[position] != configured[position] {
+                return Some(format!(
+                    "its chain {} position {} is outside the mutable scope and holds {}, \
+                     but the config says {}",
+                    chain.label,
+                    position + 1,
+                    current[position],
+                    configured[position]
+                ));
+            }
+        }
+    }
+
+    let (Some(recorded_loss), Some(metrics)) = (member.loss, &member.metrics) else {
+        return Some("it is not scored, so no recorded run retained it".to_string());
+    };
+    // A tolerance rather than exact equality: serde_json parses decimal text
+    // to within an ULP of the double the recorded run computed from, so the
+    // recomputed loss can land one bit off the recorded one without any edit.
+    // An edit that moves the loss enough to matter is orders of magnitude
+    // above the tolerance, and the trace check below compares losses that
+    // were parsed from the same recorded string, so it stays exact.
+    let recomputed = crate::loss(metrics, weights);
+    if (recorded_loss - recomputed).abs() > 1e-12 {
+        return Some(format!(
+            "its loss {recorded_loss} is not the {recomputed} that its own metrics score \
+             under the config's loss weights"
+        ));
+    }
+    match scored.get(&member.id) {
+        None => Some(
+            "trace.jsonl records no scored loss for it, so the recorded run never folded it"
+                .to_string(),
+        ),
+        Some(traced) if *traced != recorded_loss => Some(format!(
+            "its loss {recorded_loss} is not the {traced} that trace.jsonl recorded when it was scored"
+        )),
+        Some(_) => None,
+    }
 }
 
 /// Why a candidate was turned away, counted by kind — for the run summary.
@@ -1767,6 +1935,306 @@ fold:
             &record.event,
             Event::Rejected { kind, .. } if kind == "sequence_mismatch"
         )));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Rewrite population.json the way a user editing the file would: read it
+    /// as JSON, apply `corrupt`, write it back.
+    fn corrupt_population(dir: &std::path::Path, corrupt: impl FnOnce(&mut serde_json::Value)) {
+        let path = crate::trace::TaskPaths::new(dir).population();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("snapshot reads"))
+                .expect("snapshot is json");
+        corrupt(&mut value);
+        std::fs::write(&path, serde_json::to_string_pretty(&value).expect("encode"))
+            .expect("snapshot writes");
+    }
+
+    /// Attempt the resume of the task in `dir` and return the refusal.
+    async fn refused_resume(dir: &std::path::Path, seed: u64) -> RunError {
+        let paths = crate::trace::TaskPaths::new(dir);
+        let config = TaskConfig::load(paths.config()).expect("recorded config loads");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, seed));
+        resume_error(
+            Orchestrator::resume(
+                config,
+                backend,
+                Box::new(HeuristicAgent::new(seed)),
+                paths,
+                Some(8),
+            )
+            .await,
+        )
+    }
+
+    /// Assert the refusal is about a restored member, that its message names
+    /// population.json and the candidate, and that the reason contains
+    /// `expected`. Returns the candidate the refusal named.
+    fn member_refusal(error: &RunError, expected: &str) -> CandidateId {
+        match error {
+            RunError::SnapshotMemberInvalid {
+                candidate, reason, ..
+            } => {
+                let message = error.to_string();
+                assert!(message.contains("population.json"), "{message}");
+                assert!(
+                    message.contains(&candidate.to_string()),
+                    "the refusal must name the candidate: {message}"
+                );
+                assert!(reason.contains(expected), "{reason}");
+                *candidate
+            }
+            other => panic!("expected a restored-member refusal, got {other:?}"),
+        }
+    }
+
+    /// Harm one of an unvalidated restore: `job_spec_for` falls back to the
+    /// scaffold's starting sequence for a binder chain the candidate lacks, so
+    /// a restored parent missing that chain would have it folded silently and
+    /// its child scored as designed. Resume refuses the member instead.
+    #[tokio::test]
+    async fn a_restored_member_missing_a_binder_chain_is_refused() {
+        let dir = temp_dir("resume-missing-chain");
+        run_stopped(&dir, 4242, 2).await;
+
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let before: crate::trace::PopulationSnapshot =
+            crate::trace::read_json(paths.population()).expect("snapshot reads");
+        let victim = before.members[0].id;
+
+        corrupt_population(&dir, |value| {
+            value["members"][0]["sequence"]["chains"]
+                .as_object_mut()
+                .expect("chains")
+                .clear();
+        });
+
+        let error = refused_resume(&dir, 4242).await;
+        assert_eq!(member_refusal(&error, "no chain H"), victim);
+
+        // The refusal wrote nothing into the recorded artifacts.
+        let after: crate::trace::PopulationSnapshot =
+            crate::trace::read_json(paths.population()).expect("snapshot reads");
+        assert_eq!(after.cycle, before.cycle);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Harm two of an unvalidated restore: `apply_to` checks only the
+    /// positions a proposal substitutes, so a restored parent with an edited
+    /// immutable position would propagate that residue into its children.
+    /// Resume refuses the member instead.
+    #[tokio::test]
+    async fn a_restored_member_with_an_edited_immutable_position_is_refused() {
+        let dir = temp_dir("resume-edited-position");
+        run_stopped(&dir, 4242, 2).await;
+
+        // Position 1 of chain H is outside both mutable regions, which start
+        // at 26 and 51 (one-based).
+        corrupt_population(&dir, |value| {
+            let chains = value["members"][0]["sequence"]["chains"]
+                .as_object_mut()
+                .expect("chains");
+            let key = chains.keys().next().expect("a binder chain").clone();
+            let mut residues: Vec<char> =
+                chains[&key].as_str().expect("sequence").chars().collect();
+            residues[0] = if residues[0] == 'A' { 'C' } else { 'A' };
+            chains.insert(
+                key,
+                serde_json::Value::String(residues.into_iter().collect()),
+            );
+        });
+
+        let error = refused_resume(&dir, 4242).await;
+        member_refusal(&error, "outside the mutable scope");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Harm three of an unvalidated restore: a fabricated loss makes the
+    /// member `population.best()`, and completion writes it to `best.json`
+    /// and `manifest.best_candidate`. Both shapes are refused: a loss the
+    /// member's own metrics do not score, and a self-consistent loss no fold
+    /// in the trace ever recorded.
+    #[tokio::test]
+    async fn a_restored_member_with_a_fabricated_loss_is_refused() {
+        let dir = temp_dir("resume-fabricated-loss");
+        run_stopped(&dir, 4242, 2).await;
+
+        // No recorded loss is negative: every penalty is clamped to 0..1.
+        corrupt_population(&dir, |value| {
+            value["members"][0]["loss"] = serde_json::json!(-1.0);
+        });
+        let error = refused_resume(&dir, 4242).await;
+        member_refusal(&error, "loss weights");
+
+        // The fabrication the weights check cannot catch: rewrite a metric
+        // and recompute the loss from it, so member and weights agree. The
+        // fixture never reports iptm 1.0, so the recomputed loss differs
+        // from the one the trace recorded when this candidate was scored.
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let mut snapshot: crate::trace::PopulationSnapshot =
+            crate::trace::read_json(paths.population()).expect("snapshot reads");
+        let victim = &mut snapshot.members[0];
+        victim.metrics.as_mut().expect("members are scored").iptm = 1.0;
+        let config = TaskConfig::load(paths.config()).expect("recorded config loads");
+        victim.loss = Some(crate::loss(
+            victim.metrics.as_ref().expect("members are scored"),
+            &config.loss,
+        ));
+        crate::trace::write_json(paths.population(), &snapshot).expect("snapshot writes");
+
+        let error = refused_resume(&dir, 4242).await;
+        member_refusal(&error, "trace.jsonl");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A resume killed after extending the plan leaves a manifest whose
+    /// `cycles_planned` is larger than the config's own count. A bare resume
+    /// continues the manifest's plan rather than report the run complete
+    /// against a total the manifest does not carry.
+    #[tokio::test]
+    async fn a_bare_resume_continues_the_plan_the_manifest_recorded() {
+        let dir = temp_dir("resume-plan");
+        run_stopped(&dir, 4242, 3).await;
+
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let mut manifest: RunManifest =
+            crate::trace::read_json(paths.manifest()).expect("manifest reads");
+        assert_eq!(manifest.cycles_completed, 3);
+        manifest.cycles_planned = 6;
+        crate::trace::write_json(paths.manifest(), &manifest).expect("manifest writes");
+
+        let config = TaskConfig::load(paths.config()).expect("recorded config loads");
+        assert_eq!(config.design.cycles, 3, "the config still plans three");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 4242));
+        let mut orchestrator = Orchestrator::resume(
+            config,
+            backend,
+            Box::new(HeuristicAgent::new(4242)),
+            paths.clone(),
+            None,
+        )
+        .await
+        .expect("resumes");
+        let summary = orchestrator.run().await.expect("runs");
+        assert_eq!(summary.cycles_completed, 6);
+
+        let manifest: RunManifest =
+            crate::trace::read_json(paths.manifest()).expect("manifest reads");
+        assert_eq!(manifest.cycles_planned, 6);
+        assert_eq!(manifest.cycles_completed, 6);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Wraps the fixture and reports a different service version, the way a
+    /// service upgraded between the recorded run and the resume would.
+    struct UpgradedBackend {
+        inner: FixtureBackend,
+        version: String,
+    }
+
+    #[async_trait::async_trait]
+    impl FoldBackend for UpgradedBackend {
+        fn name(&self) -> &str {
+            "upgraded-fixture"
+        }
+
+        async fn health(&self) -> Result<crate::contract::Health, FoldError> {
+            let mut health = self.inner.health().await?;
+            health.version = self.version.clone();
+            Ok(health)
+        }
+
+        async fn fold(
+            &self,
+            job: crate::contract::JobSpec,
+        ) -> Result<crate::contract::FoldResult, FoldError> {
+            self.inner.fold(job).await
+        }
+    }
+
+    /// `folds`, `usage` and `best_candidate` span both runs, so the manifest
+    /// must not name the resumed run's service for the whole result. The
+    /// original fields keep describing the run that produced them, and the
+    /// resume's health-check values land in the resume fields.
+    #[tokio::test]
+    async fn a_resume_records_its_service_version_beside_the_original() {
+        let dir = temp_dir("resume-service-version");
+        run_stopped(&dir, 4242, 2).await;
+
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let before: RunManifest =
+            crate::trace::read_json(paths.manifest()).expect("manifest reads");
+
+        let config = TaskConfig::load(paths.config()).expect("recorded config loads");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+        let backend = Arc::new(UpgradedBackend {
+            inner: FixtureBackend::planted(&scaffold, &scope, 4242),
+            version: "9.9.9-test".to_string(),
+        });
+        let mut orchestrator = Orchestrator::resume(
+            config,
+            backend,
+            Box::new(HeuristicAgent::new(4242)),
+            paths.clone(),
+            Some(6),
+        )
+        .await
+        .expect("resumes");
+        orchestrator.run().await.expect("runs");
+
+        let after: RunManifest = crate::trace::read_json(paths.manifest()).expect("manifest reads");
+        assert_eq!(after.protocol, before.protocol);
+        assert_eq!(after.service_version, before.service_version);
+        assert_eq!(after.resumed_protocol, Some(before.protocol.clone()));
+        assert_eq!(
+            after.resumed_service_version,
+            Some("9.9.9-test".to_string())
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A truncated artifact exists, so the refusal must carry the read error
+    /// rather than claim there is no such file.
+    #[tokio::test]
+    async fn a_corrupt_artifact_is_reported_as_corrupt_not_missing() {
+        let dir = temp_dir("resume-corrupt");
+        run_stopped(&dir, 4242, 2).await;
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let manifest: RunManifest =
+            crate::trace::read_json(paths.manifest()).expect("manifest reads");
+
+        std::fs::write(paths.manifest(), r#"{"task_id": "trunc"#).expect("write");
+        let error = refused_resume(&dir, 4242).await;
+        match &error {
+            RunError::NoManifest { detail, .. } => {
+                let message = error.to_string();
+                assert!(message.contains("run.json"), "{message}");
+                assert!(!detail.is_empty(), "{message}");
+                assert!(message.contains(detail.as_str()), "{message}");
+            }
+            other => panic!("expected a run.json read failure, got {other:?}"),
+        }
+
+        crate::trace::write_json(paths.manifest(), &manifest).expect("manifest writes");
+        std::fs::write(paths.population(), r#"{"members": ["#).expect("write");
+        let error = refused_resume(&dir, 4242).await;
+        match &error {
+            RunError::NoSnapshot { detail, .. } => {
+                let message = error.to_string();
+                assert!(message.contains("population.json"), "{message}");
+                assert!(!detail.is_empty(), "{message}");
+                assert!(message.contains(detail.as_str()), "{message}");
+            }
+            other => panic!("expected a population.json read failure, got {other:?}"),
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

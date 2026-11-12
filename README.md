@@ -312,10 +312,13 @@ fh resume --task <task-id>      # or --path <task-dir>, like fh board
 The resumed run rebuilds the population, the per-cycle records and the
 admission counters from the task directory. It appends to `trace.jsonl` with
 the sequence numbers continuing, and candidate ids continue after the highest
-id the recorded run assigned. `run.json` gains `resumed_from_cycle` and
-`generator_reseeded`, and its `usage` reports both runs' spend.
+id the recorded run assigned. `run.json` gains `resumed_from_cycle`,
+`generator_reseeded`, `resumed_protocol` and `resumed_service_version`, and
+its `usage` reports both runs' spend. Its original `protocol` and
+`service_version` keep describing the recorded run, because `folds` and
+`best_candidate` span both runs.
 
-Two limits are deliberate.
+Three limits are deliberate.
 
 - **The config must match.** The resume loads the `task.yaml` saved in the
   task directory and refuses to run when its digest is not the `config_sha256`
@@ -323,10 +326,22 @@ Two limits are deliberate.
   criteria in one population and one lineage, so no flag allows it. Start a
   new task with `fh run` instead. `--cycles` extends the planned total
   without touching the config, so extending a run is not a config change.
+- **The snapshot must be genuine.** A resume folds the members it restores
+  and designs from them, so it first checks every member of `population.json`
+  against the config and the trace: the scaffold's binder chains at the
+  scaffold's lengths, the config's residue at every position outside the
+  mutable scope, and the loss the member's own metrics and the trace's
+  scoring event produce. One failing member refuses the whole resume, and the
+  refusal names the file and the candidate. Restore the file from a copy the
+  recorded run wrote, or run the task again.
 - **The generator is re-seeded.** The manifest records the seed but not the
   position in its stream, so a resumed run seeds a fresh generator and its
   parent selection and proposals diverge from what one uninterrupted run
-  would have produced. The same config, seed and backend reproduce the same
+  would have produced. The divergence has a second source: `snapshot()`
+  writes members in ranked order, so the resumed population restores a
+  different member order from the recorded run's insertion order, and
+  `select_parent` iterates members in that order. The original order is not
+  recoverable. The same config, seed and backend reproduce the same
   trace for one uninterrupted run, but not across a resume. The
   `task_resumed` trace event and the manifest record the re-seed rather than
   hiding it.
