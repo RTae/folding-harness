@@ -24,15 +24,18 @@ use tokio::task::JoinSet;
 
 use crate::agent::{AgentError, DesignAgent};
 use crate::contract::FoldResult;
-use crate::fold::{job_spec_for, metrics_from, FoldBackend, FoldError};
+use crate::fold::{
+    job_spec_for, metrics_from, verify_output, FoldBackend, FoldError, Verification,
+};
 use crate::skills::{executor, DesignSkill, Legality, Router, SkillContext};
 use crate::trace::{
     now_ms, Event, PopulationSnapshot, RunManifest, StructureSnapshot, TaskPaths, TraceRecord,
     TraceWriter,
 };
 use crate::{
-    AdmissionOutcome, Candidate, CandidateId, ConfigError, CycleOutcome, MutableScope, Population,
-    Proposal, ProposalError, Scaffold, SearchHistory, SkillId, TaskConfig, TaskId,
+    AdmissionOutcome, BinderSequence, Candidate, CandidateId, ConfigError, CycleOutcome,
+    MutableScope, Population, Proposal, ProposalError, RejectReason, Scaffold, SearchHistory,
+    SkillId, TaskConfig, TaskId,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +58,8 @@ pub enum RunError {
     NoExecutor { skill: String },
     #[error("the founder sequence could not be folded: {0}")]
     FounderFoldFailed(String),
+    #[error("there is no founder to design from. {reason}. Check the service against the contract in src/contract.rs")]
+    FounderSequenceMismatch { reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +312,45 @@ impl Orchestrator {
         })
     }
 
+    /// Re-verify one fold result against the sequence that was sent, and
+    /// record the outcome in the trace.
+    ///
+    /// Returns the [`RejectReason`] when the service reported a different
+    /// sequence, after emitting `Event::Rejected`. The caller decides what a
+    /// rejection means: `run_cycle` drops the candidate and continues,
+    /// `seed_founder` fails the run. Returns `None` when the check matched or
+    /// when there was nothing to check, which emits a note instead. `subject`
+    /// names what was not re-verified in that note.
+    async fn verify_and_record(
+        &mut self,
+        cycle: u32,
+        candidate: CandidateId,
+        sequence: &BinderSequence,
+        result: &FoldResult,
+        subject: &str,
+    ) -> Result<Option<RejectReason>, RunError> {
+        match verify_output(&self.scaffold, sequence, result) {
+            Verification::Mismatch(reason) => {
+                self.emit(Event::Rejected {
+                    cycle,
+                    candidate,
+                    kind: reason.kind().to_string(),
+                    reason: reason.to_string(),
+                })?;
+                Ok(Some(reason))
+            }
+            Verification::NothingToCheck { reason } => {
+                self.emit(Event::Note {
+                    cycle,
+                    source: "verification".to_string(),
+                    text: format!("{subject} not re-verified: {reason}"),
+                })?;
+                Ok(None)
+            }
+            Verification::Matched => Ok(None),
+        }
+    }
+
     /// Fold the input sequence as cycle 0 and admit it.
     ///
     /// The founder is admitted even if it would fail the gates: it is the
@@ -314,7 +358,7 @@ impl Orchestrator {
     /// parent at all. A note records the gate it failed, so nothing is hidden.
     async fn seed_founder(&mut self) -> Result<(), RunError> {
         let id = self.next_candidate_id();
-        let founder = Candidate::founder(id, crate::BinderSequence::from_scaffold(&self.scaffold));
+        let founder = Candidate::founder(id, BinderSequence::from_scaffold(&self.scaffold));
 
         self.emit(Event::FoldStarted {
             cycle: 0,
@@ -340,6 +384,17 @@ impl Orchestrator {
             candidate: id,
             elapsed_ms: result.elapsed_ms,
         })?;
+
+        // Re-verify before scoring, so a service that answered with a
+        // different sequence never becomes the founder.
+        if let Some(reason) = self
+            .verify_and_record(0, id, &founder.sequence, &result, "founder sequence")
+            .await?
+        {
+            return Err(RunError::FounderSequenceMismatch {
+                reason: reason.to_string(),
+            });
+        }
 
         let metrics = metrics_from(&result.confidence);
         if let Err(reason) = self.config.gates.check(&metrics) {
@@ -490,6 +545,26 @@ impl Orchestrator {
                         candidate: candidate.id,
                         elapsed_ms: result.elapsed_ms,
                     })?;
+
+                    // Re-verify before scoring, so a service that answered
+                    // with a different sequence never reaches the gates or
+                    // the loss. A mismatch is recorded, and the run moves on
+                    // to the next candidate.
+                    if self
+                        .verify_and_record(
+                            cycle,
+                            candidate.id,
+                            &candidate.sequence,
+                            &result,
+                            "sequence",
+                        )
+                        .await?
+                        .is_some()
+                    {
+                        self.history.note_rejected(decision.skill);
+                        rejected += 1;
+                        continue;
+                    }
 
                     let metrics = metrics_from(&result.confidence);
                     let scored = candidate.scored(metrics.clone(), &self.config.loss);
@@ -1019,6 +1094,147 @@ fold:
         assert!(records
             .iter()
             .any(|record| matches!(&record.event, Event::Rejected { .. })));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Wraps the fixture and substitutes one residue on every fold from
+    /// `corrupt_from` onward, counting calls. The founder folds first, so
+    /// `corrupt_from: 1` admits the founder and corrupts every candidate from
+    /// the cycles, while `corrupt_from: 0` corrupts the founder itself.
+    struct SubstitutingBackend {
+        inner: FixtureBackend,
+        calls: std::sync::atomic::AtomicUsize,
+        corrupt_from: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl FoldBackend for SubstitutingBackend {
+        fn name(&self) -> &str {
+            "substituting-fixture"
+        }
+
+        async fn health(&self) -> Result<crate::contract::Health, FoldError> {
+            self.inner.health().await
+        }
+
+        async fn fold(
+            &self,
+            job: crate::contract::JobSpec,
+        ) -> Result<crate::contract::FoldResult, FoldError> {
+            let mut result = self.inner.fold(job).await?;
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call >= self.corrupt_from {
+                let residue = result
+                    .structure
+                    .ca_trace
+                    .iter_mut()
+                    .find(|residue| residue.designed)
+                    .expect("the fixture traces every designed residue");
+                residue.residue = if residue.residue == 'A' { 'C' } else { 'A' };
+            }
+            Ok(result)
+        }
+    }
+
+    /// The end-to-end form of the re-verification: a service that quietly
+    /// answers with a different sequence has every candidate rejected under
+    /// `sequence_mismatch`, and the trace records the chain, the position and
+    /// both residues.
+    #[tokio::test]
+    async fn a_backend_that_substitutes_a_residue_has_its_candidates_rejected() {
+        let dir = temp_dir("verification");
+        let mut config = TaskConfig::from_yaml(YAML).expect("config parses");
+        config.design.cycles = 2;
+        let (scaffold, scope) = config.resolve().expect("resolves");
+
+        let backend = Arc::new(SubstitutingBackend {
+            inner: FixtureBackend::planted(&scaffold, &scope, 5),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            corrupt_from: 1,
+        });
+        let mut orchestrator = Orchestrator::prepare(
+            config,
+            backend,
+            Box::new(HeuristicAgent::new(5)),
+            crate::trace::TaskPaths::new(&dir),
+            TaskId("verification".to_string()),
+        )
+        .await
+        .expect("prepares");
+
+        let summary = orchestrator.run().await.expect("completes");
+        assert_eq!(summary.cycles_completed, 2);
+        // Only the founder survives: every candidate came back corrupted.
+        assert_eq!(orchestrator.population().len(), 1);
+
+        let records = crate::trace::read_all(crate::trace::TaskPaths::new(&dir).trace())
+            .expect("trace reads");
+        let reason = records
+            .iter()
+            .find_map(|record| match &record.event {
+                Event::Rejected { kind, reason, .. } if kind == "sequence_mismatch" => {
+                    Some(reason.clone())
+                }
+                _ => None,
+            })
+            .expect("a substituted residue is rejected");
+        // The first designed residue of chain H, which no proposal can reach
+        // because it sits outside the mutable scope.
+        assert!(reason.contains("chain H"), "{reason}");
+        assert!(reason.contains("position 1"), "{reason}");
+        assert!(reason.contains("sent Q"), "{reason}");
+        assert!(reason.contains("returned A"), "{reason}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The founder half of re-verification: a service that answers with a
+    /// different sequence for the founder fails the run, and the error names
+    /// the cause rather than reporting an empty population.
+    #[tokio::test]
+    async fn a_founder_the_service_changed_fails_the_run_naming_the_cause() {
+        let dir = temp_dir("founder-verification");
+        let config = TaskConfig::from_yaml(YAML).expect("config parses");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+
+        let backend = Arc::new(SubstitutingBackend {
+            inner: FixtureBackend::planted(&scaffold, &scope, 5),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            corrupt_from: 0,
+        });
+        let mut orchestrator = Orchestrator::prepare(
+            config,
+            backend,
+            Box::new(HeuristicAgent::new(5)),
+            crate::trace::TaskPaths::new(&dir),
+            TaskId("founder-verification".to_string()),
+        )
+        .await
+        .expect("prepares");
+
+        let error = orchestrator.run().await.expect_err("the run must fail");
+        assert!(
+            matches!(error, RunError::FounderSequenceMismatch { .. }),
+            "expected a founder sequence mismatch, got {error:?}"
+        );
+        // The full message, pinned exactly: the consequence, the cause with
+        // its chain, position and both residues, and the way out.
+        assert_eq!(
+            error.to_string(),
+            "there is no founder to design from. sequence mismatch on chain H: \
+             position 1: the harness sent Q, the service returned A. \
+             Check the service against the contract in src/contract.rs"
+        );
+
+        // The rejection lands in the trace one event before the failure, so
+        // nothing is hidden by the run stopping.
+        let records = crate::trace::read_all(crate::trace::TaskPaths::new(&dir).trace())
+            .expect("trace reads");
+        assert!(records.iter().any(|record| matches!(
+            &record.event,
+            Event::Rejected { kind, .. } if kind == "sequence_mismatch"
+        )));
 
         std::fs::remove_dir_all(&dir).ok();
     }
