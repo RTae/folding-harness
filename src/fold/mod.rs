@@ -80,13 +80,26 @@ pub fn job_spec_for(
     let mut chains = Vec::with_capacity(scaffold.chains.len());
     for chain in &scaffold.chains {
         let (text, designed) = match chain.role {
-            ChainRole::Binder => (
-                sequence
-                    .chain(chain.id)
-                    .unwrap_or(chain.sequence.as_str())
-                    .to_string(),
-                true,
-            ),
+            ChainRole::Binder => {
+                // `BinderSequence::from_scaffold` fills every binder chain,
+                // so a chain missing here is a harness bug, not a service
+                // state. Say so in debug builds: otherwise the harness sends
+                // the scaffold's starting residues for a chain it believes it
+                // designed, and the fold is computed on the wrong molecule.
+                // The fallback stays so release behaviour is unchanged.
+                debug_assert!(
+                    sequence.chain(chain.id).is_some(),
+                    "binder chain {} is missing from the candidate sequence",
+                    chain.label
+                );
+                (
+                    sequence
+                        .chain(chain.id)
+                        .unwrap_or(chain.sequence.as_str())
+                        .to_string(),
+                    true,
+                )
+            }
             ChainRole::Target => (chain.sequence.clone(), false),
         };
         chains.push(ChainSpec {
@@ -506,5 +519,24 @@ mod tests {
 
         let sent = verify_output(&scaffold, &sequence, &result(trace(&["QWQL", "MKTV"])));
         assert_eq!(sent, Verification::Matched);
+    }
+
+    /// The wire job's binder chain carries the candidate's sequence, not the
+    /// scaffold's starting one, so the service folds the molecule that was
+    /// designed. The target chain keeps the scaffold's sequence.
+    #[test]
+    fn the_job_carries_the_designed_sequence_not_the_scaffold_start() {
+        let scaffold = scaffold();
+        let mut sequence = BinderSequence::from_scaffold(&scaffold);
+        assert!(sequence.replace(ChainId(0), 1, 'W'));
+
+        let job = job_spec_for("job", &scaffold, &sequence, &FoldConfig::default());
+
+        let binder = &job.chains[0];
+        assert_eq!(binder.sequence, "QWQL");
+        assert!(binder.designed);
+        let target = &job.chains[1];
+        assert_eq!(target.sequence, "MKTV");
+        assert!(!target.designed);
     }
 }
