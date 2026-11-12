@@ -21,11 +21,41 @@ pub enum Step {
     Fail(AgentError),
 }
 
+/// Handle one event's bytes: hand each `data:` payload to `on_event`.
+///
+/// `[DONE]` and unparsable payloads are skipped: a keep-alive or a comment is
+/// not an error, and neither is a field a wire has added since. An event with
+/// no `data:` line yields no handler call.
+fn dispatch_event<F>(event: &[u8], on_event: &mut F) -> Result<(), AgentError>
+where
+    F: FnMut(&Value) -> Step,
+{
+    let event = String::from_utf8_lossy(event);
+
+    for line in event.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if let Step::Fail(error) = on_event(&value) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 /// Read a response body as server-sent events, handing each `data:` payload to
 /// `on_event`.
 ///
-/// `[DONE]` and unparsable payloads are skipped: a keep-alive or a comment is
-/// not an error, and neither is a field a wire has added since.
+/// A final event that arrives without its terminating blank line is flushed to
+/// `on_event` when the stream ends, under the same skipping rules as a
+/// delimited one.
 pub async fn read_events<F>(
     response: reqwest::Response,
     host: &str,
@@ -44,24 +74,12 @@ where
 
         while let Some(at) = buffer.windows(2).position(|pair| pair == b"\n\n") {
             let event: Vec<u8> = buffer.drain(..at + 2).collect();
-            let event = String::from_utf8_lossy(&event);
-
-            for line in event.lines() {
-                let Some(data) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                let data = data.trim();
-                if data.is_empty() || data == "[DONE]" {
-                    continue;
-                }
-                let Ok(value) = serde_json::from_str::<Value>(data) else {
-                    continue;
-                };
-                if let Step::Fail(error) = on_event(&value) {
-                    return Err(error);
-                }
-            }
+            dispatch_event(&event, &mut on_event)?;
         }
+    }
+
+    if !buffer.is_empty() {
+        dispatch_event(&buffer, &mut on_event)?;
     }
     Ok(())
 }
@@ -171,6 +189,65 @@ data: {\"text\":\"after\"}\n\
     #[tokio::test]
     async fn a_handler_can_stop_the_stream() {
         let error = collect(FAILING, 6)
+            .await
+            .expect_err("the handler failed it");
+        assert!(error.to_string().contains("boom"), "{error}");
+    }
+
+    /// The last event has no terminating blank line, not even a newline.
+    const UNTERMINATED: &str = "data: {\"text\":\"first\"}\n\
+    \n\
+    data: {\"text\":\"last\"}";
+
+    #[tokio::test]
+    async fn a_final_event_without_a_blank_line_still_arrives() {
+        assert_eq!(
+            collect(UNTERMINATED, 5).await.unwrap(),
+            vec!["first", "last"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_final_event_survives_one_byte_chunks() {
+        assert_eq!(
+            collect(UNTERMINATED, 1).await.unwrap(),
+            vec!["first", "last"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_final_event_survives_a_single_chunk() {
+        assert_eq!(
+            collect(UNTERMINATED, UNTERMINATED.len()).await.unwrap(),
+            vec!["first", "last"]
+        );
+    }
+
+    const TRAILING_NO_DATA: &str = "data: {\"text\":\"kept\"}\n\
+    \n\
+    event: ping\n";
+
+    #[tokio::test]
+    async fn a_trailing_fragment_without_a_data_line_yields_nothing() {
+        assert_eq!(collect(TRAILING_NO_DATA, 5).await.unwrap(), vec!["kept"]);
+    }
+
+    const TRAILING_DONE: &str = "data: {\"text\":\"kept\"}\n\
+    \n\
+    data: [DONE]";
+
+    #[tokio::test]
+    async fn a_trailing_done_without_a_blank_line_is_not_an_event() {
+        assert_eq!(collect(TRAILING_DONE, 5).await.unwrap(), vec!["kept"]);
+    }
+
+    const FAILING_TAIL: &str = "data: {\"text\":\"before\"}\n\
+    \n\
+    data: {\"type\":\"boom\"}";
+
+    #[tokio::test]
+    async fn a_handler_failure_on_the_flushed_event_is_returned() {
+        let error = collect(FAILING_TAIL, 6)
             .await
             .expect_err("the handler failed it");
         assert!(error.to_string().contains("boom"), "{error}");

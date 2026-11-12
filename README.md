@@ -12,7 +12,7 @@ renders better than a terminal does.
 
 > **Status: working proof of concept.** The cycle, the contract, the gates, the
 > population, the trace, the manifest, the dashboard, the chat screen, the web
-> view and the chat history are implemented, and 119 tests pass. `fh run` completes end to end both in-process
+> view and the chat history are implemented, and 190 tests pass. `fh run` completes end to end both in-process
 > and over HTTP, and produces the identical run either way.
 >
 > Not done yet: the model-backed skills, inverse folding and likelihood-guided
