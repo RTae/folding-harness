@@ -19,8 +19,7 @@ terms, which are often stricter than the Apache-2.0 on this code.
 - **One Rust crate in `src/`.** No Python, no Node, no second runtime, no
   build step for assets. The web view's page, script and stylesheet compile
   into the binary.
-- **Run all four commands before you call a change done.** There is no CI and
-  no pre-commit hook in this repo, so they are the only gate.
+- **Run all four commands before you call a change done.**
 
   ```bash
   cargo build
@@ -28,6 +27,19 @@ terms, which are often stricter than the Apache-2.0 on this code.
   cargo fmt --all
   cargo clippy --all-targets -- -D warnings
   ```
+
+- **Install the pre-commit hook once.** It runs the two fast checks, so a
+  misformatted or warning-carrying commit cannot land. There is still no CI, so
+  the hook and your own runs are the whole gate.
+
+  ```bash
+  cp scripts/pre-commit .git/hooks/pre-commit
+  chmod +x .git/hooks/pre-commit
+  ```
+
+  The hook is a copy rather than a symlink or a `core.hooksPath` setting, so it
+  stays out of the git config and out of anyone else's clone until they install
+  it. Fix what it reports. Do not skip it.
 
 - **The fixture path must work with nothing else present.** A GPU, a compute
   service and the network may all be absent. A change that makes `fh run`
