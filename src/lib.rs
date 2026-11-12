@@ -64,7 +64,7 @@ pub use population::{AdmissionOutcome, Population, PopulationConfig, PopulationS
 pub use proposal::{Capability, Proposal, ProposalError, SkillId, Substitution};
 pub use scaffold::{
     is_standard_aa, BinderSequence, BinderTopology, Chain, ChainRole, FixedResidue, MutableScope,
-    Region, Scaffold, ScaffoldError, AMINO_ACIDS,
+    Region, RegionSpan, Scaffold, ScaffoldError, AMINO_ACIDS,
 };
 pub use search::{CycleOutcome, CycleRecord, SearchHistory, SearchState, SkillStats};
 
