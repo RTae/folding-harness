@@ -119,12 +119,15 @@ fn scope_view(paths: &TaskPaths) -> Option<ScopeView> {
     let regions = scope
         .regions()
         .iter()
-        .map(|region| RegionView {
-            name: region.name.clone(),
-            chain: region.chain.0,
-            start: region.start + 1,
-            end: region.end,
-            mutable: scope.region_positions(&region.name).len(),
+        .map(|region| {
+            let span = region.display_span();
+            RegionView {
+                name: region.name.clone(),
+                chain: region.chain.0,
+                start: span.start,
+                end: span.end,
+                mutable: scope.region_positions(&region.name).len(),
+            }
         })
         .collect();
 

@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::ops::Range;
 
 use crate::ids::ChainId;
@@ -83,12 +84,31 @@ impl Chain {
 /// Task YAML uses one-based inclusive bounds because that is how residues are
 /// numbered in the literature; the conversion happens once, in
 /// [`crate::config`], and everything downstream of it is zero-based half-open.
+/// Display converts back through [`Region::display_span`], the only place
+/// that adds one to a stored start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Region {
     pub name: String,
     pub chain: ChainId,
     pub start: usize,
     pub end: usize,
+}
+
+/// A region's bounds as every display writes them: one-based inclusive.
+///
+/// [`fmt::Display`] renders the pair as `start..end`, the form a task YAML
+/// uses, so a user can read a printed region and pin a residue from it
+/// without converting anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl fmt::Display for RegionSpan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}..{}", self.start, self.end)
+    }
 }
 
 impl Region {
@@ -106,6 +126,18 @@ impl Region {
 
     pub fn positions(&self) -> Range<usize> {
         self.start..self.end
+    }
+
+    /// The bounds of this region for display, one-based inclusive. A
+    /// zero-based half-open end already reads as the inclusive one-based
+    /// position, so only the start moves. This is the one place that
+    /// converts a stored region back out. The conversion into it lives in
+    /// [`crate::config::TaskConfig::to_scaffold`].
+    pub fn display_span(&self) -> RegionSpan {
+        RegionSpan {
+            start: self.start + 1,
+            end: self.end,
+        }
     }
 }
 
@@ -495,5 +527,37 @@ impl BinderSequence {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn region(start: usize, end: usize) -> Region {
+        Region {
+            name: "loop1".to_string(),
+            chain: ChainId(0),
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn a_stored_region_displays_with_the_start_incremented_and_the_end_unchanged() {
+        // examples/vhh_demo.yaml writes loop1 as 26..33, and
+        // `TaskConfig::to_scaffold` stores that as the half-open 25..33.
+        // The half-open end already reads as the inclusive one-based
+        // position, so only the start moves on the way out.
+        let span = region(25, 33).display_span();
+        assert_eq!((span.start, span.end), (26, 33));
+        assert_eq!(span.to_string(), "26..33");
+    }
+
+    #[test]
+    fn a_single_residue_region_displays_as_one_position() {
+        // A YAML region of start 30, end 30 is stored as 29..30. It must
+        // read back as 30..30, the case an off-by-one shows up in first.
+        assert_eq!(region(29, 30).display_span().to_string(), "30..30");
     }
 }

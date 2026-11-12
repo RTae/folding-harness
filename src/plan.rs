@@ -216,10 +216,9 @@ impl Plan {
             let mutable = self.scope.region_positions(&region.name).len();
             let pinned = region.len() - mutable;
             lines.push(format!(
-                "  {:<10} residues {}..{}  {} mutable{}",
+                "  {:<10} residues {}  {} mutable{}",
                 region.name,
-                region.start + 1,
-                region.end,
+                region.display_span(),
                 mutable,
                 if pinned > 0 {
                     format!(", {pinned} pinned")
