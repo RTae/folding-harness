@@ -1196,8 +1196,10 @@ fn restored_member_defect(
     // to within an ULP of the double the recorded run computed from, so the
     // recomputed loss can land one bit off the recorded one without any edit.
     // An edit that moves the loss enough to matter is orders of magnitude
-    // above the tolerance, and the trace check below compares losses that
-    // were parsed from the same recorded string, so it stays exact.
+    // above the tolerance. The trace check below stays exact for a different
+    // reason: serde_json round-trips an f64 through decimal text without
+    // loss, so the two files hold the same double even though they are two
+    // files.
     let recomputed = crate::loss(metrics, weights);
     if (recorded_loss - recomputed).abs() > 1e-12 {
         return Some(format!(
@@ -2004,6 +2006,9 @@ fold:
             crate::trace::read_json(paths.population()).expect("snapshot reads");
         let victim = before.members[0].id;
 
+        let manifest_before = std::fs::read(paths.manifest()).expect("manifest reads");
+        let trace_before = std::fs::read(paths.trace()).expect("trace reads");
+
         corrupt_population(&dir, |value| {
             value["members"][0]["sequence"]["chains"]
                 .as_object_mut()
@@ -2018,6 +2023,16 @@ fold:
         let after: crate::trace::PopulationSnapshot =
             crate::trace::read_json(paths.population()).expect("snapshot reads");
         assert_eq!(after.cycle, before.cycle);
+        assert_eq!(
+            std::fs::read(paths.manifest()).expect("manifest reads"),
+            manifest_before,
+            "a refused resume rewrote run.json"
+        );
+        assert_eq!(
+            std::fs::read(paths.trace()).expect("trace reads"),
+            trace_before,
+            "a refused resume appended to trace.jsonl"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
