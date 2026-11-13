@@ -1,0 +1,31 @@
+[project]
+name = "fh-foundry-service"
+version = "0.1.0"
+description = "Reference fh.fold/v1 compute service running RosettaCommons/foundry RF3"
+readme = "README.md"
+requires-python = ">=3.12"
+# The service itself is standard library only. foundry is an extra, pinned
+# to one commit because its inference API is documented as not yet stable.
+dependencies = []
+
+[project.optional-dependencies]
+rf3 = [
+    "rc-foundry[all] @ git+https://github.com/RosettaCommons/foundry.git@0d0b0ba44fab7ca76aa4b625c014ce5964c7d284",
+]
+
+[project.scripts]
+fh-foundry-service = "foundry_service.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["foundry_service"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100

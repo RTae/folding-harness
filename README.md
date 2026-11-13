@@ -241,6 +241,42 @@ fh run task.yaml --url http://127.0.0.1:8080
 nobody. The only difference between the two modes is whether the bytes crossed
 a socket.
 
+## The foundry compute service
+
+`service/foundry/` is the first real backend: a Python service that speaks
+`fh.fold/v1` and runs RF3 from RosettaCommons/foundry behind it, pinned to
+one commit. It is the `service/` exception in `AGENTS.md`: a folding model
+needs Python and a GPU, `src/` never imports from `service/`, and no Rust
+test requires it.
+
+Two things a reader of its numbers must know. RF3 does not report
+`interface_plddt` or `interface_contacts`, and the loss weights both and the
+gates threshold both, so the service derives them from the predicted
+coordinates and records them as adapter-derived in
+`foundry_service/derive.py`. And an early-stopped RF3 run writes no structure
+at all, so the service disables early stopping explicitly and fails the job
+with a reason if one shows up anyway. The weights are BSD-3: foundry's
+`LICENSE.md` covers the weights in terms, and the licence sentence and the
+pinned commit are recorded in `foundry_service/rf3.py`.
+
+Deploy it on the GPU machine and point the harness at it. Its own README
+carries the install steps and the honest list of what no test here could
+verify, since the RF3 call needs a GPU.
+
+```bash
+cd service/foundry
+pip install -e ".[rf3]" && foundry install base-models
+python -m foundry_service --host 127.0.0.1 --port 8080
+```
+
+The service's own tests need no GPU, no foundry and no Linux, and they bind
+port 0:
+
+```bash
+cd service/foundry
+uv run --no-project --python 3.13 --with pytest python -m pytest
+```
+
 ## The cycle
 
 ```
@@ -492,8 +528,10 @@ be offered an inverse-folding skill.
 
 ## Layout
 
-One crate, `src/`, layered bottom up. Everything is Rust. There is no Python,
-no Node, and no second runtime.
+One crate, `src/`, layered bottom up. Everything in the crate is Rust. There
+is no Python, no Node, and no second runtime inside it. The one exception is
+`service/`, which holds reference compute services implementing
+`src/contract.rs` from the other side, the way `AGENTS.md` allows.
 
 | path | holds |
 | --- | --- |
@@ -524,6 +562,7 @@ no Node, and no second runtime.
 | `src/cli/` | the `fh` subcommands. These belong to the binary, so `anyhow` and the terminal stay out of the library |
 | `src/main.rs` | argument parsing, then a hand-off to `cli::dispatch` |
 | `src/tests.rs` | tests for the domain layer |
+| `service/foundry/` | the Python compute service running foundry RF3 behind `fh.fold/v1`. Not part of the crate |
 
 The layering is a convention here rather than something the compiler enforces,
 so `CLAUDE.md` states it. The modules `scaffold`, `proposal`, `candidate`,
