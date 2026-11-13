@@ -18,11 +18,14 @@ terms, which are often stricter than the Apache-2.0 on this code.
 
 - **One Rust crate in `src/`.** No Python, no Node, no second runtime inside
   the crate, and no build step for assets. The web view's page, script and
-  stylesheet compile into the binary. The one exception is `service/`, which
-  holds reference compute services implementing `src/contract.rs` from the
-  other side. A folding model needs Python and a GPU, and the contract exists
-  precisely so that stays out of this crate. Nothing in `src/` may import from
-  `service/`, and no Rust test may require it.
+  stylesheet compile into the binary. Two directories sit outside that rule.
+  `service/` holds reference compute services implementing `src/contract.rs`
+  from the other side, because a folding model needs Python and a GPU and the
+  contract exists precisely so that stays out of this crate. `tools/` holds
+  development oracles that generate test fixtures, which may need a second
+  runtime for the same reason. Nothing in `src/` may import from either, no
+  Rust test may require either, and the root `Cargo.toml` declares no workspace
+  member under either, so a build of the shipping crate never compiles them.
 - **Run all four commands before you call a change done.**
 
   ```bash
