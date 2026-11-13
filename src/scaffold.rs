@@ -407,6 +407,15 @@ impl Scaffold {
             lengths.insert(chain.id, chain.len());
         }
 
+        // Every chain gets a label, target chains included, so a refusal can
+        // name a chain the task YAML wrote even when the scope does not carry
+        // its residues.
+        let labels: BTreeMap<ChainId, String> = self
+            .chains
+            .iter()
+            .map(|chain| (chain.id, chain.label.clone()))
+            .collect();
+
         for region in &self.regions {
             if let Some(flags) = mask.get_mut(&region.chain) {
                 for pos in region.positions() {
@@ -433,6 +442,7 @@ impl Scaffold {
             mask,
             regions: self.regions.clone(),
             lengths,
+            labels,
         })
     }
 }
@@ -442,11 +452,16 @@ impl Scaffold {
 /// Fields are private and there is no `Deserialize` impl: a scope can only be
 /// produced by [`Scaffold::mutable_scope`], so it cannot be forged from a
 /// config file or a network payload.
+///
+/// The scope also carries each chain's label, so a refusal in
+/// [`MutableScope::propose`] can name the chain the way the task YAML wrote
+/// it.
 #[derive(Debug, Clone)]
 pub struct MutableScope {
     mask: BTreeMap<ChainId, Vec<bool>>,
     regions: Vec<Region>,
     lengths: BTreeMap<ChainId, usize>,
+    labels: BTreeMap<ChainId, String>,
 }
 
 impl MutableScope {
@@ -460,6 +475,23 @@ impl MutableScope {
 
     pub fn chain_len(&self, chain: ChainId) -> Option<usize> {
         self.lengths.get(&chain).copied()
+    }
+
+    /// The name an error message gives a chain: its label, which is what the
+    /// task YAML wrote. The id fallback only serves a substitution that names
+    /// a chain id the scaffold does not carry, which only a hand-built
+    /// [`crate::proposal::Substitution`] can do.
+    pub(crate) fn chain_label(&self, id: ChainId) -> String {
+        self.labels
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// Every chain label the scope carries, for a [`crate::Proposal`] to name
+    /// chains by at apply time.
+    pub(crate) fn chain_labels(&self) -> &BTreeMap<ChainId, String> {
+        &self.labels
     }
 
     pub fn chains(&self) -> impl Iterator<Item = ChainId> + '_ {
