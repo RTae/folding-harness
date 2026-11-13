@@ -25,9 +25,40 @@ pub struct Usage {
     pub folds: u64,
     /// Time backends reported for those folds.
     pub fold_ms: u64,
+    /// Whether the model calls behind these totals were counted.
+    ///
+    /// `Some(true)`: the source counted its calls, so `calls` is a measurement
+    /// and `calls: 0` means no model was called. The token fields can still
+    /// undercount under a counted source, because a gateway may strip the
+    /// usage body from a response, which leaves the call counted and its tokens
+    /// absent. `Some(false)`: the source does not count, so calls may have
+    /// happened that these totals do not show. `None`: nobody said. A
+    /// `run.json` written before this field existed reads back as `None`, which
+    /// stays unknown rather than turning into a claim either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls_counted: Option<bool>,
 }
 
 impl Usage {
+    /// Zero spend, counted. The source made no model calls and says so, which
+    /// is a measurement of zero rather than silence about it.
+    pub fn no_model_calls() -> Self {
+        Usage {
+            calls_counted: Some(true),
+            ..Usage::default()
+        }
+    }
+
+    /// Zero spend, not counted. The source does not count model calls, so any
+    /// call it made is missing from these totals. Reporting zeros without
+    /// this flag would claim the calls were free.
+    pub fn uncounted() -> Self {
+        Usage {
+            calls_counted: Some(false),
+            ..Usage::default()
+        }
+    }
+
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens + self.output_tokens
     }
@@ -36,6 +67,12 @@ impl Usage {
     /// fold counts while another reports the model spend, and a resumed run
     /// adds what the recorded run spent to what this one spends. The manifest
     /// carries the total.
+    ///
+    /// The sum is counted only when both sources counted. One source that
+    /// does not count leaves part of the total unmeasured, so the sum reports
+    /// uncounted. Failing that, one source that never said, such as a
+    /// recorded manifest from before `calls_counted` existed, leaves the sum
+    /// unknown.
     pub fn summed_with(self, other: Usage) -> Usage {
         Usage {
             calls: self.calls + other.calls,
@@ -43,21 +80,41 @@ impl Usage {
             output_tokens: self.output_tokens + other.output_tokens,
             folds: self.folds + other.folds,
             fold_ms: self.fold_ms + other.fold_ms,
+            calls_counted: match (self.calls_counted, other.calls_counted) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            },
         }
     }
 
+    /// Nothing to report: every counter is zero and no uncounted model call
+    /// is on record. A snapshot that says its model spend was not counted is
+    /// never empty, because silence about it would read as zero.
     pub fn is_empty(&self) -> bool {
-        *self == Usage::default()
+        self.calls == 0
+            && self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.folds == 0
+            && self.fold_ms == 0
+            && self.calls_counted != Some(false)
     }
 
     /// One line for a footer or a summary.
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
-        if self.calls > 0 {
-            parts.push(format!(
+        match self.calls_counted {
+            Some(true) if self.calls > 0 => parts.push(format!(
                 "{} call(s), {} in / {} out tokens",
                 self.calls, self.input_tokens, self.output_tokens
-            ));
+            )),
+            Some(true) => {}
+            Some(false) => parts.push("an uncounted number of model calls".to_string()),
+            None if self.calls > 0 => parts.push(format!(
+                "{} call(s), {} in / {} out tokens, counting not recorded",
+                self.calls, self.input_tokens, self.output_tokens
+            )),
+            None => parts.push("model calls of unknown count".to_string()),
         }
         if self.folds > 0 {
             parts.push(format!(
@@ -116,6 +173,10 @@ impl Meter {
         self.inner.fold_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
     }
 
+    /// The meter is a counting device: every call and fold it shows went
+    /// through `record_call` or `record_fold`, so its snapshots report their
+    /// model spend as counted. A zero call count from a meter means the meter
+    /// saw no model calls, not that counting was skipped.
     pub fn snapshot(&self) -> Usage {
         Usage {
             calls: self.inner.calls.load(Ordering::Relaxed),
@@ -123,6 +184,7 @@ impl Meter {
             output_tokens: self.inner.output_tokens.load(Ordering::Relaxed),
             folds: self.inner.folds.load(Ordering::Relaxed),
             fold_ms: self.inner.fold_ms.load(Ordering::Relaxed),
+            calls_counted: Some(true),
         }
     }
 }
@@ -163,6 +225,11 @@ mod tests {
         assert_eq!(usage.folds, 1);
         assert_eq!(usage.fold_ms, 1500);
         assert_eq!(usage.total_tokens(), 170);
+        assert_eq!(
+            usage.calls_counted,
+            Some(true),
+            "a meter counts, so its snapshot says so"
+        );
         assert_eq!(meter.snapshot(), other.snapshot());
     }
 
@@ -174,6 +241,7 @@ mod tests {
             output_tokens: 0,
             folds: 4,
             fold_ms: 900,
+            calls_counted: Some(true),
         };
         let calls = Usage {
             calls: 2,
@@ -181,6 +249,7 @@ mod tests {
             output_tokens: 40,
             folds: 0,
             fold_ms: 0,
+            calls_counted: Some(true),
         };
         assert_eq!(
             folds.summed_with(calls),
@@ -190,9 +259,40 @@ mod tests {
                 output_tokens: 40,
                 folds: 4,
                 fold_ms: 900,
+                calls_counted: Some(true),
             }
         );
-        assert_eq!(folds.summed_with(Usage::default()), folds);
+        assert_eq!(folds.summed_with(Usage::no_model_calls()), folds);
+    }
+
+    #[test]
+    fn a_sum_is_counted_only_when_every_source_counted() {
+        let counted = Usage {
+            calls: 2,
+            calls_counted: Some(true),
+            ..Usage::default()
+        };
+        // One source that does not count leaves part of the total unmeasured,
+        // whichever side it sits on.
+        assert_eq!(
+            counted.summed_with(Usage::uncounted()).calls_counted,
+            Some(false)
+        );
+        assert_eq!(
+            Usage::uncounted().summed_with(counted).calls_counted,
+            Some(false)
+        );
+        // One source that never said, such as a manifest from before the
+        // field existed, leaves the total unknown rather than counted.
+        assert_eq!(counted.summed_with(Usage::default()).calls_counted, None);
+        assert_eq!(Usage::default().summed_with(counted).calls_counted, None);
+        // Uncounted beats unknown: the total definitely misses spend.
+        assert_eq!(
+            Usage::uncounted()
+                .summed_with(Usage::default())
+                .calls_counted,
+            Some(false)
+        );
     }
 
     #[test]
@@ -203,6 +303,7 @@ mod tests {
             output_tokens: 40,
             folds: 5,
             fold_ms: 2500,
+            calls_counted: Some(true),
         };
         let fresh = Usage {
             calls: 1,
@@ -210,6 +311,7 @@ mod tests {
             output_tokens: 5,
             folds: 3,
             fold_ms: 900,
+            calls_counted: Some(true),
         };
         assert_eq!(
             recorded.summed_with(fresh),
@@ -219,6 +321,7 @@ mod tests {
                 output_tokens: 45,
                 folds: 8,
                 fold_ms: 3400,
+                calls_counted: Some(true),
             }
         );
     }
@@ -228,6 +331,97 @@ mod tests {
         let usage = Meter::new().snapshot();
         assert!(usage.is_empty());
         assert_eq!(usage.summary(), "nothing spent yet");
+    }
+
+    #[test]
+    fn usage_from_a_manifest_that_predates_the_field_reads_as_unknown() {
+        // The wire form an old run.json carries: counters, no calls_counted.
+        let old = serde_json::json!({
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "folds": 4,
+            "fold_ms": 900,
+        });
+        let usage: Usage = serde_json::from_value(old).expect("old wire form reads");
+        assert_eq!(
+            usage.calls_counted, None,
+            "an old manifest must not be read as a claim either way"
+        );
+        assert_eq!(usage.folds, 4);
+
+        let new = serde_json::json!({
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "folds": 0,
+            "fold_ms": 0,
+            "calls_counted": false,
+        });
+        let usage: Usage = serde_json::from_value(new).expect("new wire form reads");
+        assert_eq!(usage.calls_counted, Some(false));
+    }
+
+    #[test]
+    fn the_counted_field_serializes_only_when_somebody_said() {
+        let json = serde_json::to_value(Usage::default()).expect("encodes");
+        assert!(
+            json.get("calls_counted").is_none(),
+            "unknown stays absent on the wire, so a re-read stays unknown"
+        );
+        let json = serde_json::to_value(Usage::uncounted()).expect("encodes");
+        assert_eq!(json["calls_counted"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn uncounted_spend_is_never_empty_and_never_silent() {
+        let usage = Usage::uncounted();
+        assert!(
+            !usage.is_empty(),
+            "silence about uncounted calls reads as zero"
+        );
+        assert_eq!(usage.summary(), "an uncounted number of model calls");
+    }
+
+    #[test]
+    fn counted_zero_calls_says_nothing_about_models_rather_than_reporting_zero_tokens() {
+        let usage = Usage {
+            folds: 2,
+            fold_ms: 400,
+            ..Usage::no_model_calls()
+        };
+        assert!(!usage.is_empty());
+        let summary = usage.summary();
+        assert!(!summary.contains("call(s)"), "{summary}");
+        assert!(!summary.contains("unknown"), "{summary}");
+        assert!(!summary.contains("uncounted"), "{summary}");
+        assert!(summary.contains("2 fold(s)"), "{summary}");
+    }
+
+    #[test]
+    fn unknown_spend_says_unknown_in_both_of_its_shapes() {
+        // No counters at all: the source never said whether calls happened.
+        let unknown = Usage {
+            folds: 3,
+            fold_ms: 700,
+            ..Usage::default()
+        };
+        let summary = unknown.summary();
+        assert!(
+            summary.contains("model calls of unknown count"),
+            "{summary}"
+        );
+
+        // Counters from before the field existed: the numbers show, flagged.
+        let inherited = Usage {
+            calls: 5,
+            input_tokens: 500,
+            output_tokens: 90,
+            ..Usage::default()
+        };
+        let summary = inherited.summary();
+        assert!(summary.contains("5 call(s)"), "{summary}");
+        assert!(summary.contains("counting not recorded"), "{summary}");
     }
 
     #[test]

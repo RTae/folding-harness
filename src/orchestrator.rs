@@ -135,7 +135,10 @@ pub struct Orchestrator {
     folds: usize,
     meter: crate::usage::Meter,
     /// What the recorded run spent before a resume. Added to the meter's
-    /// snapshot so `run.json` reports both runs' spend.
+    /// snapshot so `run.json` reports both runs' spend. A fresh run has no
+    /// recorded spend, and that is known, so its base is
+    /// [`Usage::no_model_calls`](crate::usage::Usage::no_model_calls) rather
+    /// than the unknown a default carries.
     usage_base: crate::usage::Usage,
     /// The first cycle `run` executes. One for a fresh run, one past the
     /// recorded run's last completed cycle for a resume.
@@ -217,7 +220,7 @@ impl Orchestrator {
             next_id: 0,
             folds: 0,
             meter: crate::usage::Meter::new(),
-            usage_base: crate::usage::Usage::default(),
+            usage_base: crate::usage::Usage::no_model_calls(),
             start_cycle: 1,
             resumed_from: None,
             on_event: None,
@@ -1845,6 +1848,48 @@ fold:
         }
     }
 
+    /// Delegates every decision to the heuristic and reports uncounted model
+    /// spend, standing in for an `LlmAgent` over a provider that keeps the
+    /// `ModelProvider::usage()` default.
+    struct NonCountingAgent {
+        inner: HeuristicAgent,
+    }
+
+    #[async_trait::async_trait]
+    impl DesignAgent for NonCountingAgent {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        async fn choose(
+            &mut self,
+            legal: &[SkillId],
+            state: &crate::SearchState,
+        ) -> Result<crate::agent::Decision, AgentError> {
+            self.inner.choose(legal, state).await
+        }
+
+        fn usage(&self) -> crate::usage::Usage {
+            crate::usage::Usage::uncounted()
+        }
+    }
+
+    /// Rewrite the `usage` block of the recorded `run.json` in `dir`, the way
+    /// the corrupt-artifact tests edit `population.json`.
+    fn rewrite_recorded_usage(dir: &std::path::Path, usage: serde_json::Value) {
+        let paths = crate::trace::TaskPaths::new(dir);
+        let mut value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(paths.manifest()).expect("manifest reads"),
+        )
+        .expect("manifest is json");
+        value["usage"] = usage;
+        std::fs::write(
+            paths.manifest(),
+            serde_json::to_string_pretty(&value).expect("encode"),
+        )
+        .expect("manifest writes");
+    }
+
     #[tokio::test]
     async fn an_agent_that_reports_spend_has_it_folded_into_the_manifest() {
         let dir = temp_dir("agent-spend");
@@ -1858,6 +1903,7 @@ fold:
             output_tokens: 120,
             folds: 0,
             fold_ms: 0,
+            calls_counted: Some(true),
         };
         let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 11));
         let mut orchestrator = Orchestrator::prepare(
@@ -1881,6 +1927,11 @@ fold:
         assert_eq!(manifest.usage.calls, spent.calls);
         assert_eq!(manifest.usage.input_tokens, spent.input_tokens);
         assert_eq!(manifest.usage.output_tokens, spent.output_tokens);
+        assert_eq!(
+            manifest.usage.calls_counted,
+            Some(true),
+            "a counted agent's manifest says its model spend was counted"
+        );
         assert!(
             manifest.usage.folds > 0,
             "the run's own folds must still land in the usage"
@@ -1915,6 +1966,11 @@ fold:
                 .expect("manifest reads");
         assert_eq!(manifest.usage.calls, 0);
         assert_eq!(manifest.usage.total_tokens(), 0);
+        assert_eq!(
+            manifest.usage.calls_counted,
+            Some(true),
+            "no model was called, and the manifest says that rather than staying silent"
+        );
         assert_eq!(manifest.usage.folds, manifest.folds as u64);
         assert!(manifest.usage.folds > 0);
         // The summary names the spend that happened and never claims a token
@@ -1922,6 +1978,8 @@ fold:
         let summary = manifest.usage.summary();
         assert!(summary.contains("fold(s)"), "{summary}");
         assert!(!summary.contains("call(s)"), "{summary}");
+        assert!(!summary.contains("uncounted"), "{summary}");
+        assert!(!summary.contains("unknown"), "{summary}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1941,22 +1999,17 @@ fold:
 
         // Give the recorded run a spend of its own by editing run.json the
         // way the corrupt-artifact tests edit population.json.
-        let mut value: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(paths.manifest()).expect("manifest reads"),
-        )
-        .expect("manifest is json");
-        value["usage"] = serde_json::json!({
-            "calls": 10,
-            "input_tokens": 1000,
-            "output_tokens": 200,
-            "folds": 7,
-            "fold_ms": 3500,
-        });
-        std::fs::write(
-            paths.manifest(),
-            serde_json::to_string_pretty(&value).expect("encode"),
-        )
-        .expect("manifest writes");
+        rewrite_recorded_usage(
+            &dir,
+            serde_json::json!({
+                "calls": 10,
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "folds": 7,
+                "fold_ms": 3500,
+                "calls_counted": true,
+            }),
+        );
 
         let spent = crate::usage::Usage {
             calls: 3,
@@ -1964,6 +2017,7 @@ fold:
             output_tokens: 120,
             folds: 0,
             fold_ms: 0,
+            calls_counted: Some(true),
         };
         let config = TaskConfig::load(paths.config()).expect("recorded config loads");
         let (scaffold, scope) = config.resolve().expect("resolves");
@@ -1996,6 +2050,156 @@ fold:
         assert_eq!(manifest.usage.output_tokens, 200 + spent.output_tokens);
         assert_eq!(manifest.usage.folds, 7 + new_folds as u64);
         assert_eq!(manifest.usage.fold_ms, 3500);
+        assert_eq!(
+            manifest.usage.calls_counted,
+            Some(true),
+            "counted base plus counted run stays counted"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A run whose agent wraps a provider that does not count must not write
+    /// `calls: 0` and stop: zeros in a manifest read as free calls, so the
+    /// manifest carries `calls_counted: false` and the summary says the spend
+    /// was not counted.
+    #[tokio::test]
+    async fn an_agent_that_does_not_count_writes_an_uncounted_manifest_rather_than_zero_spend() {
+        let dir = temp_dir("uncounted-spend");
+        let mut config = TaskConfig::from_yaml(YAML).expect("config parses");
+        config.design.cycles = 2;
+        let (scaffold, scope) = config.resolve().expect("resolves");
+
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 13));
+        let mut orchestrator = Orchestrator::prepare(
+            config,
+            backend,
+            Box::new(NonCountingAgent {
+                inner: HeuristicAgent::new(13),
+            }),
+            crate::trace::TaskPaths::new(&dir),
+            TaskId("uncounted-spend".to_string()),
+        )
+        .await
+        .expect("prepares");
+
+        orchestrator.run().await.expect("completes");
+
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let manifest: RunManifest =
+            crate::trace::read_json(paths.manifest()).expect("manifest reads");
+        assert_eq!(manifest.usage.calls, 0);
+        assert_eq!(manifest.usage.calls_counted, Some(false));
+        assert!(!manifest.usage.is_empty());
+        assert!(manifest.usage.summary().contains("uncounted"));
+
+        // The flag is on the wire, so a later reader sees the claim.
+        let raw = std::fs::read_to_string(paths.manifest()).expect("manifest reads");
+        assert!(raw.contains("\"calls_counted\": false"), "{raw}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A recorded `run.json` from before `calls_counted` existed has counters
+    /// but no claim. Resuming over it must sum into unknown, not into the
+    /// fresh run's counted state: part of the total predates counting.
+    #[tokio::test]
+    async fn a_resume_over_a_manifest_that_predates_counting_reads_as_unknown() {
+        let dir = temp_dir("resume-unknown");
+        run_stopped(&dir, 4343, 3).await;
+
+        // The old wire form: no calls_counted field at all.
+        rewrite_recorded_usage(
+            &dir,
+            serde_json::json!({
+                "calls": 4,
+                "input_tokens": 400,
+                "output_tokens": 80,
+                "folds": 7,
+                "fold_ms": 3500,
+            }),
+        );
+
+        let spent = crate::usage::Usage {
+            calls: 1,
+            input_tokens: 10,
+            output_tokens: 5,
+            folds: 0,
+            fold_ms: 0,
+            calls_counted: Some(true),
+        };
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let config = TaskConfig::load(paths.config()).expect("recorded config loads");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 4343));
+        let mut orchestrator = Orchestrator::resume(
+            config,
+            backend,
+            Box::new(SpendingAgent {
+                inner: HeuristicAgent::new(4343),
+                spent,
+            }),
+            paths.clone(),
+            Some(6),
+        )
+        .await
+        .expect("resumes");
+        orchestrator.run().await.expect("runs");
+
+        let manifest: RunManifest =
+            crate::trace::read_json(paths.manifest()).expect("manifest reads");
+        assert_eq!(manifest.usage.calls, 4 + spent.calls);
+        assert_eq!(
+            manifest.usage.calls_counted, None,
+            "an old base makes the total unknown, not counted and not uncounted"
+        );
+        let summary = manifest.usage.summary();
+        assert!(summary.contains("counting not recorded"), "{summary}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The two sources of a resume may disagree: the recorded run counted,
+    /// this run's agent does not. The total contains unmeasured spend, so it
+    /// reports uncounted rather than the recorded run's counted state.
+    #[tokio::test]
+    async fn a_resume_whose_sources_disagree_about_counting_reports_uncounted() {
+        let dir = temp_dir("resume-disagree");
+        run_stopped(&dir, 4444, 3).await;
+
+        rewrite_recorded_usage(
+            &dir,
+            serde_json::json!({
+                "calls": 4,
+                "input_tokens": 400,
+                "output_tokens": 80,
+                "folds": 7,
+                "fold_ms": 3500,
+                "calls_counted": true,
+            }),
+        );
+
+        let paths = crate::trace::TaskPaths::new(&dir);
+        let config = TaskConfig::load(paths.config()).expect("recorded config loads");
+        let (scaffold, scope) = config.resolve().expect("resolves");
+        let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 4444));
+        let mut orchestrator = Orchestrator::resume(
+            config,
+            backend,
+            Box::new(NonCountingAgent {
+                inner: HeuristicAgent::new(4444),
+            }),
+            paths.clone(),
+            Some(6),
+        )
+        .await
+        .expect("resumes");
+        orchestrator.run().await.expect("runs");
+
+        let manifest: RunManifest =
+            crate::trace::read_json(paths.manifest()).expect("manifest reads");
+        assert_eq!(manifest.usage.calls, 4, "the recorded calls still sum");
+        assert_eq!(manifest.usage.calls_counted, Some(false));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2015,6 +2219,7 @@ fold:
             output_tokens: 60,
             folds: 0,
             fold_ms: 0,
+            calls_counted: Some(true),
         };
         let backend = Arc::new(FixtureBackend::planted(&scaffold, &scope, 21));
         let mut orchestrator = Orchestrator::prepare(
@@ -2044,6 +2249,7 @@ fold:
         assert_eq!(manifest.usage.calls, spent.calls);
         assert_eq!(manifest.usage.input_tokens, spent.input_tokens);
         assert_eq!(manifest.usage.output_tokens, spent.output_tokens);
+        assert_eq!(manifest.usage.calls_counted, Some(true));
 
         std::fs::remove_dir_all(&dir).ok();
     }
