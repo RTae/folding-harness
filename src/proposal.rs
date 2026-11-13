@@ -93,17 +93,28 @@ pub struct Substitution {
 /// trace, the dashboard and the run output, and whoever is debugging a
 /// refused proposal is still the person who wrote `chain: H`. The id stays
 /// available for callers that match on it.
+///
+/// The variants that name a position render it one-based, the number the task
+/// YAML wrote, while their `position` field keeps the stored zero-based form
+/// for callers that match on it. The increment lives in the format string, so
+/// no `position` field ever holds a converted value. `ParentMismatch` carries
+/// its detail as a rendered sentence, which is the one field holding text a
+/// user reads rather than a number a caller matches on.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ProposalError {
     #[error(
-        "chain '{label}' position {position} is outside the mutable scope (framework or pinned)"
+        "chain '{label}' position {pos} is outside the mutable scope (framework or pinned)",
+        pos = position + 1
     )]
     Immutable {
         chain: ChainId,
         label: String,
         position: usize,
     },
-    #[error("chain '{label}' position {position} is beyond the chain (length {len})")]
+    #[error(
+        "chain '{label}' position {pos} is beyond the chain (length {len})",
+        pos = position + 1
+    )]
     OutOfRange {
         chain: ChainId,
         label: String,
@@ -111,7 +122,8 @@ pub enum ProposalError {
         len: usize,
     },
     #[error(
-        "chain '{label}' is not a binder chain, so position {position} in it cannot be substituted; aim the proposal at a binder chain"
+        "chain '{label}' is not a binder chain, so position {pos} in it cannot be substituted; aim the proposal at a binder chain",
+        pos = position + 1
     )]
     NotABinderChain {
         chain: ChainId,
@@ -120,7 +132,10 @@ pub enum ProposalError {
     },
     #[error("'{to}' is not a standard amino acid")]
     NonStandardResidue { to: char },
-    #[error("chain '{label}' position {position} is substituted more than once")]
+    #[error(
+        "chain '{label}' position {pos} is substituted more than once",
+        pos = position + 1
+    )]
     DuplicatePosition {
         chain: ChainId,
         label: String,
@@ -188,7 +203,7 @@ impl Proposal {
                     detail: format!(
                         "no residue at chain '{}' position {} in the parent sequence",
                         self.chain_label(sub.chain),
-                        sub.position
+                        sub.position + 1
                     ),
                 });
             }
@@ -381,28 +396,40 @@ design:
 
     #[test]
     fn a_refused_framework_position_names_the_label_the_task_wrote() {
-        // VHH_YAML stores loop1 as 4..8, so position 0 is framework.
+        // VHH_YAML writes loop1 as 5..8, which `TaskConfig::to_scaffold`
+        // stores as the half-open 4..8, so stored position 0 is framework.
+        // A user writing one-based YAML calls that residue 1, so the refusal
+        // must show 1. A dropped increment shows 0 and a doubled one shows 2,
+        // and both fail here.
         let msg = refusal(&scope_for(VHH_YAML), vec![sub(0, 0, 'W')]);
         assert_eq!(
             msg,
-            "chain 'H' position 0 is outside the mutable scope (framework or pinned)"
+            "chain 'H' position 1 is outside the mutable scope (framework or pinned)"
         );
+        assert!(!msg.contains("position 0"), "got: {msg}");
+        assert!(!msg.contains("position 2"), "got: {msg}");
         assert!(!msg.contains("chain0"), "got: {msg}");
     }
 
     #[test]
     fn a_position_past_the_chain_end_names_the_label_the_task_wrote() {
+        // Stored position 50 on a twenty-residue chain must show as 51, the
+        // number a one-based reader would give the residue past the end.
         let msg = refusal(&scope_for(VHH_YAML), vec![sub(0, 50, 'W')]);
-        assert_eq!(msg, "chain 'H' position 50 is beyond the chain (length 20)");
+        assert_eq!(msg, "chain 'H' position 51 is beyond the chain (length 20)");
+        assert!(!msg.contains("position 50"), "got: {msg}");
+        assert!(!msg.contains("position 52"), "got: {msg}");
         assert!(!msg.contains("chain0"), "got: {msg}");
     }
 
     #[test]
     fn a_repeated_position_names_the_label_the_task_wrote() {
-        // Position 4 is inside loop1, so the pair passes every check until
-        // the repeat.
+        // Stored position 4 is inside loop1, so the pair passes every check
+        // until the repeat. The message must show it as 5.
         let msg = refusal(&scope_for(VHH_YAML), vec![sub(0, 4, 'W'), sub(0, 4, 'Y')]);
-        assert_eq!(msg, "chain 'H' position 4 is substituted more than once");
+        assert_eq!(msg, "chain 'H' position 5 is substituted more than once");
+        assert!(!msg.contains("position 4"), "got: {msg}");
+        assert!(!msg.contains("position 6"), "got: {msg}");
         assert!(!msg.contains("chain0"), "got: {msg}");
     }
 
@@ -432,10 +459,14 @@ design:
             .apply_to(&parent)
             .expect_err("the short parent has no residue at position 4")
             .to_string();
+        // The proposal substitutes stored position 4, which the message must
+        // show as 5.
         assert_eq!(
             msg,
-            "parent sequence does not fit the scaffold: no residue at chain 'H' position 4 in the parent sequence"
+            "parent sequence does not fit the scaffold: no residue at chain 'H' position 5 in the parent sequence"
         );
+        assert!(!msg.contains("position 4"), "got: {msg}");
+        assert!(!msg.contains("position 6"), "got: {msg}");
         assert!(!msg.contains("chain0"), "got: {msg}");
     }
 
@@ -449,8 +480,10 @@ design:
         let msg = refusal(&scope_for(VHH_YAML), vec![sub(1, 0, 'W')]);
         assert_eq!(
             msg,
-            "chain 'A' is not a binder chain, so position 0 in it cannot be substituted; aim the proposal at a binder chain"
+            "chain 'A' is not a binder chain, so position 1 in it cannot be substituted; aim the proposal at a binder chain"
         );
+        assert!(!msg.contains("position 0"), "got: {msg}");
+        assert!(!msg.contains("position 2"), "got: {msg}");
         assert!(!msg.contains("chain1"), "got: {msg}");
     }
 
@@ -462,7 +495,33 @@ design:
         let msg = refusal(&scope_for(VHH_YAML), vec![sub(7, 0, 'W')]);
         assert_eq!(
             msg,
-            "chain 'chain7' is not a binder chain, so position 0 in it cannot be substituted; aim the proposal at a binder chain"
+            "chain 'chain7' is not a binder chain, so position 1 in it cannot be substituted; aim the proposal at a binder chain"
         );
+    }
+
+    #[test]
+    fn a_refusal_and_the_proposal_description_show_the_same_position_number() {
+        // The point of the one-based rendering is agreement across surfaces.
+        // One stored position, 4, reaches both a refusal and a description:
+        // the duplicate check refuses it as "position 5" and an accepted
+        // proposal describes it as "chain0:5 F>W", because residue F sits at
+        // stored index 4 of ACDEFGHIKLMNPQRSTVWY. A dropped or doubled
+        // increment on either surface breaks the agreement and fails here.
+        let scope = scope_for(VHH_YAML);
+        let msg = refusal(&scope, vec![sub(0, 4, 'W'), sub(0, 4, 'Y')]);
+        assert!(msg.contains("position 5"), "got: {msg}");
+        assert!(!msg.contains("position 4"), "got: {msg}");
+
+        let proposal = scope
+            .propose(None, SkillId::PointMutation, vec![sub(0, 4, 'W')], "test")
+            .expect("stored position 4 is mutable in the scope");
+        let scaffold = TaskConfig::from_yaml(VHH_YAML)
+            .expect("fixture parses")
+            .to_scaffold()
+            .expect("fixture resolves");
+        let parent = BinderSequence::from_scaffold(&scaffold);
+        let description = proposal.describe(&parent);
+        assert_eq!(description, "chain0:5 F>W");
+        assert!(!description.contains(":4 "), "got: {description}");
     }
 }
