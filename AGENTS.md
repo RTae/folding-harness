@@ -18,14 +18,16 @@ terms, which are often stricter than the Apache-2.0 on this code.
 
 - **One Rust crate in `src/`.** No Python, no Node, no second runtime inside
   the crate, and no build step for assets. The web view's page, script and
-  stylesheet compile into the binary. Two directories sit outside that rule.
-  `service/` holds reference compute services implementing `src/contract.rs`
-  from the other side, because a folding model needs Python and a GPU and the
-  contract exists precisely so that stays out of this crate. `tools/` holds
-  development oracles that generate test fixtures, which may need a second
-  runtime for the same reason. Nothing in `src/` may import from either, no
-  Rust test may require either, and the root `Cargo.toml` declares no workspace
-  member under either, so a build of the shipping crate never compiles them.
+  stylesheet compile into the binary. Three directories sit outside that rule,
+  and none of them is compiled by a build of the shipping crate. `service/`
+  holds reference compute services implementing `src/contract.rs` from the
+  other side, because a folding model needs Python and a GPU and the contract
+  exists precisely so that stays out of this crate. `tools/` holds development
+  oracles that generate test fixtures. `runtime/` holds separate Rust crates
+  that are not workspace members of the root manifest, so the root never
+  compiles them and their tests never run as part of `cargo test` here.
+  Nothing in `src/` may import from any of the three, and no Rust test in
+  `src/` may require any of them.
 - **Run all four commands before you call a change done.**
 
   ```bash
@@ -120,7 +122,9 @@ Two separations carry the design and should survive refactors:
 ## Code and tests
 
 - `thiserror` for library errors. `anyhow` only in the binary, under `src/cli/`
-  and `src/main.rs`.
+  and `src/main.rs`. Both rules scope to the shipping crate. A crate under
+  `runtime/` may hand-write its error type when staying dependency-free is the
+  point of it, and must then say so where the type is defined.
 - Every user-causable error names the field or the file and says what to do.
 - Tests live beside the code in `#[cfg(test)] mod tests`, named after the
   behaviour they pin rather than the function they call.
