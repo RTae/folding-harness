@@ -58,6 +58,14 @@ struct RunDetail {
     manifest: Option<RunManifest>,
     population: Option<PopulationSnapshot>,
     scope: Option<ScopeView>,
+    /// The spend line, rendered server-side.
+    ///
+    /// The page shows this string instead of deriving a line from the
+    /// manifest's numeric `usage` fields, which cannot say whether the model
+    /// counts were measured. `None` means the terminal would print nothing:
+    /// no spend worth a line. The numeric fields stay in the JSON, because
+    /// `manifest` serializes whole.
+    spend: Option<String>,
 }
 
 /// The mutable scope, resolved server-side.
@@ -206,10 +214,19 @@ async fn run_detail(
     let Some(paths) = task_dir(&state.root, &id) else {
         return (StatusCode::NOT_FOUND, "no such run").into_response();
     };
+    let manifest: Option<RunManifest> = trace::read_json(paths.manifest()).ok();
+    // The same rendering and the same silence the terminal report uses:
+    // `Usage::summary` when there is spend to report, and no line when
+    // `is_empty` says the terminal would print nothing.
+    let spend = manifest
+        .as_ref()
+        .filter(|manifest| !manifest.usage.is_empty())
+        .map(|manifest| manifest.usage.summary());
     Json(RunDetail {
-        manifest: trace::read_json(paths.manifest()).ok(),
+        manifest,
         population: trace::read_json(paths.population()).ok(),
         scope: scope_view(&paths),
+        spend,
     })
     .into_response()
 }
@@ -467,6 +484,11 @@ mod tests {
     /// `run.json` is missing or unreadable, so the list stays empty without
     /// this.
     fn write_manifest(paths: &TaskPaths) {
+        write_manifest_with_usage(paths, Default::default());
+    }
+
+    /// The same run with a chosen spend snapshot.
+    fn write_manifest_with_usage(paths: &TaskPaths, usage: crate::usage::Usage) {
         let manifest = RunManifest {
             task_id: "1700-demo".to_string(),
             name: "demo".to_string(),
@@ -485,7 +507,7 @@ mod tests {
             best_candidate: None,
             best_loss: Some(0.5),
             chat_id: None,
-            usage: Default::default(),
+            usage,
             resumed_from_cycle: None,
             generator_reseeded: false,
             resumed_protocol: None,
@@ -493,6 +515,123 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&manifest).expect("encode manifest");
         std::fs::write(paths.manifest(), encoded).expect("write manifest");
+    }
+
+    /// The page and the terminal read the same manifest, so they must say the
+    /// same thing about what the run spent. The assertions compare the served
+    /// `spend` against `Usage::summary()` for the same `Usage`, which is what
+    /// the terminal report prints, so the two renderings cannot drift without
+    /// this test failing. The empty case pins the shared silence: the terminal
+    /// prints no spend line for it, so the page must receive none.
+    #[tokio::test]
+    async fn the_browser_receives_the_spend_line_the_terminal_prints() {
+        use crate::usage::Usage;
+
+        let root = TempRoot::new("spend");
+        let cases: Vec<(&str, Usage)> = vec![
+            // The source counted and made no model call: folds only, and no
+            // model wording, because a counted zero is a measurement.
+            (
+                "1700-no-calls",
+                Usage {
+                    folds: 3,
+                    fold_ms: 900,
+                    ..Usage::no_model_calls()
+                },
+            ),
+            // The source counted its calls: the totals are measurements.
+            (
+                "1700-counted",
+                Usage {
+                    calls: 2,
+                    input_tokens: 100,
+                    output_tokens: 40,
+                    folds: 3,
+                    fold_ms: 900,
+                    calls_counted: Some(true),
+                },
+            ),
+            // The source does not count: calls may have happened that the
+            // zero totals do not show.
+            ("1700-uncounted", Usage::uncounted()),
+            // A manifest written before the counted flag existed, carrying
+            // real totals. Nobody said whether they were counted, so the
+            // rendering must say that rather than imply the totals are
+            // measurements.
+            (
+                "1700-predates-the-flag",
+                Usage {
+                    calls: 5,
+                    input_tokens: 410,
+                    output_tokens: 85,
+                    folds: 3,
+                    fold_ms: 900,
+                    calls_counted: None,
+                },
+            ),
+            // Nothing on record at all: the terminal prints no spend line.
+            ("1700-empty", Usage::default()),
+        ];
+        for (id, usage) in &cases {
+            let paths = TaskPaths::new(root.path.join(id));
+            std::fs::create_dir_all(paths.root()).expect("task dir");
+            write_manifest_with_usage(&paths, *usage);
+        }
+
+        let listener = bind_loopback(0).await.expect("bind");
+        let addr = listener.local_addr().expect("bound address");
+        let served = root.path.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app(served)).await;
+        });
+
+        for (id, usage) in &cases {
+            let body: serde_json::Value = reqwest::get(format!("http://{addr}/api/runs/{id}"))
+                .await
+                .expect("request the run detail")
+                .json()
+                .await
+                .expect("read the run detail");
+            let expected = (!usage.is_empty()).then(|| usage.summary());
+            assert_eq!(
+                body["spend"],
+                serde_json::to_value(expected).expect("encodes"),
+                "the page and the terminal disagree about {id}"
+            );
+        }
+    }
+
+    /// The script reads the rendered `spend` field and nothing else. If it
+    /// ever went back to deriving a line from `usage.calls` and `usage.folds`,
+    /// the state logic would exist twice, in two languages, and only one copy
+    /// would be under test.
+    #[test]
+    fn the_script_reads_the_rendered_spend_line_and_never_rederives_it() {
+        let detail = RunDetail {
+            manifest: None,
+            population: None,
+            scope: None,
+            spend: Some("an uncounted number of model calls".to_string()),
+        };
+        let json = serde_json::to_value(&detail).expect("encodes");
+        assert_eq!(
+            json["spend"], "an uncounted number of model calls",
+            "the server must send the field under the name the script reads"
+        );
+        assert!(
+            SCRIPT.contains("detail.spend"),
+            "the script never reads the rendered spend line"
+        );
+        // Assert on the identifier rather than on `usage.calls`, because the
+        // code this replaced read `usage?.calls`, and a pin on the dotted
+        // spelling would miss a regression written the original way. The
+        // script has no legitimate reason to name `usage` at all now, so any
+        // occurrence means the state logic came back into JavaScript.
+        assert!(
+            !SCRIPT.contains("usage"),
+            "the script names `usage` again, so it is re-deriving the spend \
+             line instead of reading the one the server rendered"
+        );
     }
 
     #[tokio::test]

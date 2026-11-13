@@ -136,15 +136,6 @@ function renderFacts(detail) {
   pill.textContent = running ? "running" : "finished";
   pill.className = `pill ${running ? "running" : "finished"}`;
 
-  const usage = manifest?.usage;
-  const spend = [];
-  if (usage?.folds) spend.push(`${usage.folds} folds`);
-  if (usage?.calls) {
-    spend.push(
-      `${usage.calls} model call(s), ${usage.input_tokens}/${usage.output_tokens} tokens`,
-    );
-  }
-
   const facts = [
     ["cycle", population ? `${population.cycle}/${population.cycles_planned}` : null],
     ["best loss", four(population?.stats?.best_loss)],
@@ -153,7 +144,10 @@ function renderFacts(detail) {
     ["model", manifest?.model],
     ["seed", manifest?.seed],
     ["config", manifest?.config_sha256?.slice(0, 12)],
-    ["spent", spend.length ? spend.join(", ") : null],
+    // The server renders this line with Usage::summary, the same call the
+    // terminal report makes, so the two interfaces cannot say different
+    // things about whether the model counts were measured.
+    ["spent", detail.spend ?? null],
     ["scope", detail.scope?.summary],
   ];
 
