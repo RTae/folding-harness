@@ -2,9 +2,13 @@
 """Generate reference tensors for the four RF3 Pairformer triangle operations.
 
 The script imports the real foundry classes (TriangleMultiplication and
-TriangleAttention) and runs them on CPU in fp32 with a fixed seed. It records
-every weight, the shared input, each operation's output, and the internal
-tensors that a reimplementation is most likely to get wrong.
+TriangleAttention), injects the real trained weights of one Pairformer block
+from the published RF3 checkpoint, and runs the operations on CPU in fp32 with
+a fixed-seed input. It records every weight, the shared input, each operation's
+output, and the internal tensors that a reimplementation is most likely to get
+wrong. A default random initialisation would leave the attention output
+projection and gate all-zero, so the dumped attention outputs would be zero
+regardless of the input and a reimplementation returning zeros would match.
 
 Internal tensors are captured without reimplementing any operation body.
 Submodule forward hooks record the inputs and outputs of every nn.Module the
@@ -17,12 +21,19 @@ Output format: one file per tensor, holding raw float32 values in
 little-endian byte order, row-major (C) order, with no header. manifest.json
 names every file and records its shape and dtype.
 
+The weight values under fixtures/weights/ are a derived copy of one block of
+the RF3 checkpoint and fall under foundry's BSD-3 licence. See
+WEIGHTS-NOTICE.md beside this script.
+
 Usage:
-    .venv/bin/python generate_fixtures.py [--out fixtures] \
+    .venv/bin/python generate_fixtures.py \
+        --checkpoint ~/.foundry/checkpoints/rf3_foundry_01_24_latest_remapped.ckpt \
+        [--out fixtures] [--block 24] \
         [--foundry-src /tmp/foundry/models/rf3/src]
 """
 
 import argparse
+import hashlib
 import json
 import platform
 import subprocess
@@ -35,6 +46,19 @@ import torch
 FOUNDRY_COMMIT = "0d0b0ba44fab7ca76aa4b625c014ce5964c7d284"
 DEFAULT_FOUNDRY_SRC = "/tmp/foundry/models/rf3/src"
 
+# The "rf3" entry of REGISTERED_CHECKPOINTS in foundry's
+# models/rf3/src/rf3/checkpoints.py. The expected digest pins the exact bytes
+# so a regenerated fixture set cannot silently come from a different download.
+CHECKPOINT_URL = (
+    "https://files.ipd.uw.edu/pub/rf3/rf3_foundry_01_24_latest_remapped.ckpt"
+)
+CHECKPOINT_SHA256 = "364ef592fd8042a9cf4176d045015190f8322f961ccca38d891b20ca578d3bb0"
+# The checkpoint stores the net wrapped in foundry's EMA module, so every
+# parameter appears twice in the "model" dict: raw weights under "model." and
+# EMA shadow weights under "shadow.". EMA.forward dispatches to the shadow at
+# eval, so the shadow is what inference runs and what gets injected here.
+EMA_SHADOW_PREFIX = "shadow."
+
 SEED = 20261113
 BATCH = 1
 SEQ_LEN = 13
@@ -42,9 +66,14 @@ C_Z = 128
 C_HIDDEN_MUL = 128
 N_HEAD = 4
 D_HEAD = 32
+N_PAIRFORMER_BLOCKS = 48
+# Block 24 sits in the middle of the 48-block stack (0..47). The first and
+# last blocks see the least representative activations of any block.
+DEFAULT_BLOCK = 24
 
-# Construction order feeds the global RNG that initialises the weights, so it
-# is part of the recipe and must not change without a new seed record.
+# Construction order of the four operations. Checkpoint injection overwrites
+# every parameter, so the order no longer feeds the dumped bytes, but it stays
+# fixed to keep the recipe stable.
 OP_NAMES = [
     "tri_mul_outgoing",
     "tri_mul_incoming",
@@ -71,6 +100,80 @@ def check_foundry(foundry_src: Path) -> str:
             "Check out the pinned commit or update FOUNDRY_COMMIT deliberately."
         )
     return head
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 22), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_block_state_dict(checkpoint: Path, block: int):
+    """Returns (sha256, state-dict prefix, weights) of one Pairformer block.
+
+    Loads through foundry's own loader, `rf3._core.compat.load_checkpoint`,
+    which calls `torch.load(..., weights_only=False, map_location="cpu")` and
+    translates the pre-1.0 `foundry.*` pickle paths. The trainer reads the
+    model weights from the `"model"` key of the returned dict, at
+    `rf3/_core/trainers/fabric.py`, `_load_model`, and this does the same.
+    """
+    from rf3._core.compat import load_checkpoint
+
+    sha256 = sha256_file(checkpoint)
+    if sha256 != CHECKPOINT_SHA256:
+        raise SystemExit(
+            f"{checkpoint} has SHA-256 {sha256}, expected {CHECKPOINT_SHA256}. "
+            f"Re-download it from {CHECKPOINT_URL}, or update the pin "
+            "deliberately and record the new digest in REPRODUCIBILITY.md."
+        )
+    ckpt = load_checkpoint(checkpoint)
+    print(f"checkpoint top-level keys: {sorted(ckpt.keys())}")
+    state = ckpt["model"]
+    shadow = {
+        key.removeprefix(EMA_SHADOW_PREFIX): value
+        for key, value in state.items()
+        if key.startswith(EMA_SHADOW_PREFIX)
+    }
+    if not shadow:
+        raise SystemExit(
+            f"no state-dict key starts with {EMA_SHADOW_PREFIX!r}; the "
+            "checkpoint is not EMA-wrapped as expected"
+        )
+    marker = f"pairformer_stack.{block}."
+    block_keys = [key for key in shadow if marker in key]
+    if not block_keys:
+        raise SystemExit(f"no state-dict key contains {marker!r}")
+    prefixes = {key.split(marker)[0] + marker for key in block_keys}
+    if len(prefixes) != 1:
+        raise SystemExit(
+            f"block {block} keys sit under several prefixes: {sorted(prefixes)}"
+        )
+    prefix = prefixes.pop()
+    block_sd = {key.removeprefix(prefix): shadow[key] for key in block_keys}
+    dtypes = sorted({str(value.dtype) for value in block_sd.values()})
+    print(
+        f"block {block}: prefix {prefix!r}, {len(block_sd)} tensors, "
+        f"dtypes {dtypes}"
+    )
+    return sha256, prefix, block_sd
+
+
+def inject_block_weights(ops: dict, block_sd: dict) -> None:
+    """Loads one block's real weights into the standalone operations.
+
+    `strict=True` fails the run on any name or shape mismatch, so a silent
+    partial injection is impossible.
+    """
+    for op_name, op in ops.items():
+        prefix = op_name + "."
+        subset = {
+            key.removeprefix(prefix): value.to(torch.float32)
+            for key, value in block_sd.items()
+            if key.startswith(prefix)
+        }
+        op.load_state_dict(subset, strict=True)
 
 
 @contextmanager
@@ -334,9 +437,33 @@ def build_input():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        type=Path,
+        help=f"path to {Path(CHECKPOINT_URL).name}, downloaded from {CHECKPOINT_URL}",
+    )
+    parser.add_argument(
+        "--block",
+        type=int,
+        default=DEFAULT_BLOCK,
+        help=f"pairformer block to inject, 0..{N_PAIRFORMER_BLOCKS - 1}",
+    )
     parser.add_argument("--out", default="fixtures", help="output directory")
     parser.add_argument("--foundry-src", default=DEFAULT_FOUNDRY_SRC)
     args = parser.parse_args()
+
+    checkpoint = args.checkpoint.expanduser()
+    if not checkpoint.is_file():
+        raise SystemExit(
+            f"checkpoint {checkpoint} does not exist. Download it with:\n"
+            f"  curl -fL -o {checkpoint} {CHECKPOINT_URL}"
+        )
+    if not 0 <= args.block < N_PAIRFORMER_BLOCKS:
+        raise SystemExit(
+            f"--block {args.block} is out of range, expected "
+            f"0..{N_PAIRFORMER_BLOCKS - 1}"
+        )
 
     foundry_src = Path(args.foundry_src).resolve()
     commit = check_foundry(foundry_src)
@@ -356,7 +483,9 @@ def main():
     if torch.cuda.is_available():
         raise SystemExit("CUDA visible; the oracle requires a CPU-only run")
 
+    sha256, prefix, block_sd = load_block_state_dict(checkpoint, args.block)
     ops = build_ops()
+    inject_block_weights(ops, block_sd)
     pair = build_input()
 
     writer = FixtureWriter(Path(args.out))
@@ -376,8 +505,24 @@ def main():
             "foundry_commit": commit,
             "foundry_src": str(foundry_src),
             "seed": SEED,
+            "checkpoint": {
+                "url": CHECKPOINT_URL,
+                "filename": checkpoint.name,
+                "sha256": sha256,
+                "block": args.block,
+                "n_pairformer_blocks": N_PAIRFORMER_BLOCKS,
+                "state_dict_key": "model",
+                "ema_prefix": EMA_SHADOW_PREFIX,
+                "block_key_prefix": prefix,
+                "weights_licence": "foundry BSD-3 (code and weights); see tools/pairstack-oracle/WEIGHTS-NOTICE.md",
+            },
             "rng": {
-                "weights": f"torch.manual_seed({SEED}) before building the four ops in the order {OP_NAMES}",
+                "weights": (
+                    f"none; real trained weights of pairformer block {args.block} are injected "
+                    f"with load_state_dict(strict=True). torch.manual_seed({SEED}) still runs "
+                    f"before building the four ops in the order {OP_NAMES}, but every parameter "
+                    "is overwritten, so the dumped weights do not depend on the seed"
+                ),
                 "input": f"torch.Generator(device='cpu').manual_seed({SEED}) passed to torch.randn",
             },
             "input_shape": [BATCH, SEQ_LEN, SEQ_LEN, C_Z],

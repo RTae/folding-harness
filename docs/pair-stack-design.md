@@ -249,13 +249,31 @@ Rust implementation loading RF3 weights is licence-clean. One caveat: RF3's
 optimised path depends on cuEquivariance, which is Linux-only and separately
 licensed, and that path is not the one this design mirrors.
 
+## Checkpoint layout
+
+Settled 2026-11-13 by reading the published
+`rf3_foundry_01_24_latest_remapped.ckpt` under foundry's own loader,
+`rf3._core.compat.load_checkpoint`. No GPU needed. The checkpoint dict carries
+`current_epoch`, `global_step`, `model`, `optimizer`, `scheduler_cfg` and
+`train_cfg`. The weights sit under `model`, and every parameter appears twice
+inside it: raw weights prefixed `model.` and EMA shadow weights prefixed
+`shadow.`. The net is stored EMA-wrapped, so the earlier open question is
+answered: a loader must strip a prefix. `EMA.forward` dispatches to the shadow
+at eval, at `_core/training/EMA.py:63-68`, so the shadow weights are the ones
+foundry's inference runs. All values are float32.
+
+After the `shadow.` prefix, the main stack's keys run
+`recycler.pairformer_stack.<block>.` as the loader analysis inferred, for
+example
+`recycler.pairformer_stack.24.tri_attn_end.to_out.weight`. The MSA module
+keeps its own spelling of the same operations: `recycler.msa_module.` carries
+`tri_mult_outgoing` and `tri_mult_incoming` where the pairformer blocks carry
+`tri_mul_outgoing` and `tri_mul_incoming`. The attention attributes are
+spelled `tri_attn_start` and `tri_attn_end` in both. A loader that builds keys
+from one spelling silently misses the other module.
+
 ## Open questions
 
-- The checkpoint key names are inferred from foundry's loader, which maps by
-  exact `state_dict` name at `_core/utils/weights.py:237-247`. Whether the
-  published checkpoint is EMA-unwrapped is not confirmed from source, and a
-  wrapper would add a prefix to every key. Settled by reading one real
-  checkpoint, which needs a download but not a GPU.
 - Whether the single-representation pair-biased attention belongs inside the
   pair-stack abstraction or outside it. Foundry runs it as step 6 of the block
   with 16 heads of width 24, which is a different shape from the triangle
