@@ -199,8 +199,8 @@ BioNeMo's own tolerances, from its tests, are the ladder to copy.
   a gap between two sides is treated as a finding rather than as noise.
 
 The CPU reference in Rust is held to the bit-exact standard against the fp32
-foundry path, not to the reduced-precision ladder, because foundry on CPU runs
-in fp32 with no autocast.
+foundry path, not to the reduced-precision ladder, because the oracle calls the
+operations directly in fp32 with no trainer and no autocast.
 
 ## CPU feasibility
 
@@ -210,9 +210,17 @@ repositories play different roles.
 Foundry's `SHOULD_USE_CUEQUIVARIANCE` is false without CUDA, at
 `models/rf3/src/rf3/_core/__init__.py:31-47`, so on a CPU both triangle classes
 route to `_forward_vanilla`, which is plain PyTorch with no compiled kernel. The
-trainer's bf16-mixed precision is forced to `32-true` on CPU and MPS, at
-`_core/utils/ddp.py:48` and `61`. The whole pair stack is mirrorable on a CPU in
-fp32.
+whole pair stack is mirrorable on a CPU in fp32.
+
+Precision needs care, because the obvious reading of the config code is wrong.
+Foundry forces `32-true` only when `FOUNDRY_DEVICE` explicitly asks for cpu or
+mps, at `_core/utils/ddp.py:44-48`, or when MPS is auto-detected, at `:57-61`.
+The no-accelerator fallback sets the accelerator to cpu but never overrides
+precision, at `:62-68`, so the configured `bf16-mixed` default survives. Running
+foundry's inference engine on a machine with no accelerator therefore does not
+automatically give fp32. The oracle sidesteps this entirely: it instantiates the
+four operations directly and calls them in fp32 with no trainer and no autocast,
+so no precision policy applies.
 
 BioNeMo's triangle multiplication has no CPU path. Its `_forward_impl` calls a
 fused `layer_norm_transpose` unconditionally, at `triangle_nodes.py:682` and
