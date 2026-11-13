@@ -67,9 +67,16 @@ q = q * (1 / sqrt(head_dim))
 attn = einsum("bijhd,bikhd->bijkh", q, k) + bias
 attn = softmax(attn, over k)
 out  = gate * einsum("bijkh,bikhd->bijhd", attn, v)
-out  = to_out(out)
 if ending: out = transpose(out)
+out  = to_out(out)
 ```
+
+The transpose back happens before the output projection, not after. The two
+orders are numerically identical here, because the transpose permutes the
+position axes while the projection acts on the channel axis, so neither sees
+the other's work. The order is still written down as the source has it, since
+a reimplementation that gets it the other way round and then adds a
+position-dependent step afterwards would diverge silently.
 
 The outgoing and incoming multiplications differ only in the einsum
 subscripts. The starting and ending attentions differ only in where a
@@ -88,8 +95,14 @@ right shape and this design copies it. The axes, with what each model needs:
   length `L` at `attention.py:314` and `316`. BioNeMo calls the same thing
   `trimul_mean_normalization`. One flag, two names, same arithmetic.
 - **Bias presence.** Boltz-1 puts no biases on its triangle operations, at
-  `boltz1/config.py:61-83`. Foundry's RF3 has biases on the layer norms and on
-  the input and output projections. Per-projection flags, not one flag.
+  `boltz1/config.py:61-83`. Foundry's RF3 differs between the two operation
+  families. In triangle attention, `to_g` and `to_out` carry biases while
+  `to_q`, `to_k` and `to_v` do not. In triangle multiplication all four
+  projections, `p_in`, `g_in`, `p_out` and `g_out`, are built with
+  `bias=False` at `attention.py:255-268`, and the constructor's `bias` flag
+  controls only the two layer norms. So the axis is per-projection, not
+  per-operation, and a reimplementation that assumes one rule for both
+  families will look for parameters that do not exist.
 - **Output projection precision.** BioNeMo's `trimul_high_precision` runs the
   output projections in fp32, at `triangle_nodes.py:397-401`.
 - **Layer norm on the bias projection.** BioNeMo's `norm_bias`.
