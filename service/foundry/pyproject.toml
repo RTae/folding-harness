@@ -13,12 +13,32 @@ rf3 = [
     "rc-foundry[all] @ git+https://github.com/RosettaCommons/foundry.git@0d0b0ba44fab7ca76aa4b625c014ce5964c7d284",
 ]
 
+[dependency-groups]
+# The version "ruff clean" means, so the claim is the same on every machine.
+# Newer ruff releases keep adding default rules, and there is no CI here to
+# settle the version. Run the two checks with:
+#   uv sync --no-install-project --group dev
+#   uv run --no-sync ruff check .
+#   uv run --no-sync ruff format --check .
+# Both flags keep uv off the hatchling build of this package, which fails on
+# the rf3 direct git reference, and neither flag is needed for ruff itself.
+dev = [
+    "ruff==0.8.3",
+]
+
 [project.scripts]
 fh-foundry-service = "foundry_service.server:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# The rf3 extra pins foundry to one commit by direct git reference, and
+# hatchling refuses a direct reference in project.optional-dependencies
+# without this. Without it the package cannot be installed at all, not even
+# without the extra, because metadata generation fails first.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["foundry_service"]
@@ -29,3 +49,11 @@ pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint.per-file-ignores]
+# The wire helpers in contract.py raise ValueError, not TypeError, for a
+# payload of the wrong type. Every other wire defect there raises ValueError,
+# and the 400 handler in server.py catches ValueError. Ruff TRY004 prefers
+# TypeError and is not selected by the pinned ruff, but newer ruff releases
+# flag it. The ignore keeps the deliberate choice over the linter's taste.
+"foundry_service/contract.py" = ["TRY004"]
