@@ -49,10 +49,15 @@ pub trait DesignAgent: Send {
     }
 
     /// What this agent's model calls cost, so a run's manifest can carry the
-    /// bill. An agent that never calls a model keeps the default and reports
-    /// nothing, which reads differently from counting zero.
+    /// bill. The default reports the spend as uncounted, which fails safe: an
+    /// agent that calls a model and forgets to override this leaves a manifest
+    /// saying its spend was not measured, which is honest noise. The opposite
+    /// default would leave it claiming a counted zero, which is a false
+    /// measurement written to a durable file. An agent that makes no model
+    /// calls overrides this with [`Usage::no_model_calls`], as the heuristic
+    /// and random agents do.
     fn usage(&self) -> crate::usage::Usage {
-        crate::usage::Usage::default()
+        crate::usage::Usage::uncounted()
     }
 }
 
@@ -93,6 +98,12 @@ impl HeuristicAgent {
 impl DesignAgent for HeuristicAgent {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    /// This agent makes no model calls, so zero is a measurement rather than
+    /// the uncounted default the trait falls back to.
+    fn usage(&self) -> crate::usage::Usage {
+        crate::usage::Usage::no_model_calls()
     }
 
     async fn choose(
@@ -239,6 +250,12 @@ impl DesignAgent for RandomAgent {
         &self.name
     }
 
+    /// This agent makes no model calls, so zero is a measurement rather than
+    /// the uncounted default the trait falls back to.
+    fn usage(&self) -> crate::usage::Usage {
+        crate::usage::Usage::no_model_calls()
+    }
+
     async fn choose(
         &mut self,
         legal: &[SkillId],
@@ -273,10 +290,13 @@ pub trait ModelProvider: Send + Sync {
         true
     }
 
-    /// What this provider has spent so far. A provider that does not count
-    /// reports nothing, which reads differently from counting zero.
+    /// What this provider has spent so far. The default reports
+    /// [`Usage::uncounted`](crate::usage::Usage::uncounted): a provider that
+    /// keeps it does not count, so a run driven through it says its model
+    /// spend was not counted rather than showing zero. A provider that counts
+    /// returns a counted snapshot, as `Meter::snapshot` does.
     fn usage(&self) -> crate::usage::Usage {
-        crate::usage::Usage::default()
+        crate::usage::Usage::uncounted()
     }
 
     /// One line naming the model and where prompts go, printed before any is
@@ -656,9 +676,52 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_that_never_calls_a_model_reports_no_spend() {
-        assert!(HeuristicAgent::new(1).usage().is_empty());
-        assert!(RandomAgent::new(1).usage().is_empty());
+    fn an_agent_that_never_calls_a_model_reports_counted_zero_calls() {
+        // Zero from these agents is a measurement: they make no model calls,
+        // so the manifest may say no model was called rather than staying
+        // silent about it.
+        for usage in [HeuristicAgent::new(1).usage(), RandomAgent::new(1).usage()] {
+            assert!(usage.is_empty());
+            assert_eq!(usage.calls, 0);
+            assert_eq!(usage.calls_counted, Some(true));
+        }
+    }
+
+    /// An agent that keeps the trait default and overrides nothing.
+    struct DefaultUsageAgent;
+
+    #[async_trait]
+    impl DesignAgent for DefaultUsageAgent {
+        fn name(&self) -> &str {
+            "default"
+        }
+
+        async fn choose(
+            &mut self,
+            legal: &[SkillId],
+            _state: &SearchState,
+        ) -> Result<Decision, AgentError> {
+            let skill = legal.first().copied().ok_or(AgentError::NoLegalSkills)?;
+            Ok(Decision {
+                skill,
+                rationale: "test agent".to_string(),
+                decided_by: self.name().to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn the_trait_default_fails_safe_rather_than_claiming_a_measured_zero() {
+        // A model-calling agent that forgets to override `usage` must leave a
+        // manifest saying its spend was not counted. Claiming a counted zero
+        // would write a false measurement to a durable file, which is the exact
+        // defect the counted flag exists to prevent.
+        let usage = DefaultUsageAgent.usage();
+        assert_eq!(usage.calls_counted, Some(false));
+        assert!(
+            !usage.is_empty(),
+            "an uncounted zero must not read as no spend at all"
+        );
     }
 
     #[test]
@@ -669,6 +732,7 @@ mod tests {
             output_tokens: 40,
             folds: 0,
             fold_ms: 0,
+            calls_counted: Some(true),
         };
         let agent = LlmAgent::new(
             CountingProvider {
@@ -678,6 +742,26 @@ mod tests {
             1,
         );
         assert_eq!(agent.usage(), spent);
+    }
+
+    #[test]
+    fn an_llm_agent_over_a_provider_that_does_not_count_says_so_rather_than_reporting_zero() {
+        // StubProvider keeps the ModelProvider default. The agent passes that
+        // through, so a run driven by it writes uncounted spend into its
+        // manifest instead of zeros that read as free calls.
+        let agent = LlmAgent::new(
+            StubProvider {
+                answer: r#"{"skill":"point_mutation"}"#.to_string(),
+            },
+            1,
+        );
+        let usage = agent.usage();
+        assert_eq!(usage.calls, 0);
+        assert_eq!(usage.calls_counted, Some(false));
+        assert!(
+            !usage.is_empty(),
+            "uncounted calls must not pass as no spend"
+        );
     }
 
     #[tokio::test]

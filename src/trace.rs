@@ -463,7 +463,10 @@ pub struct RunManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
     /// What the run spent: folds, backend time, and model tokens if any.
-    /// Across a resume this is the sum of both runs' spend.
+    /// Across a resume this is the sum of both runs' spend. The sum's
+    /// `calls_counted` says whether the model figures are measurements,
+    /// whether spend went uncounted, or whether a recorded manifest that
+    /// predates the field left them unknown.
     #[serde(default)]
     pub usage: crate::usage::Usage,
     /// The cycle this run resumed from, when it resumed. The run continued
