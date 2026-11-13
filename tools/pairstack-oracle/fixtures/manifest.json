@@ -4,8 +4,19 @@
     "foundry_commit": "0d0b0ba44fab7ca76aa4b625c014ce5964c7d284",
     "foundry_src": "/private/tmp/foundry/models/rf3/src",
     "seed": 20261113,
+    "checkpoint": {
+      "url": "https://files.ipd.uw.edu/pub/rf3/rf3_foundry_01_24_latest_remapped.ckpt",
+      "filename": "rf3_foundry_01_24_latest_remapped.ckpt",
+      "sha256": "364ef592fd8042a9cf4176d045015190f8322f961ccca38d891b20ca578d3bb0",
+      "block": 24,
+      "n_pairformer_blocks": 48,
+      "state_dict_key": "model",
+      "ema_prefix": "shadow.",
+      "block_key_prefix": "recycler.pairformer_stack.24.",
+      "weights_licence": "foundry BSD-3 (code and weights); see tools/pairstack-oracle/WEIGHTS-NOTICE.md"
+    },
     "rng": {
-      "weights": "torch.manual_seed(20261113) before building the four ops in the order ['tri_mul_outgoing', 'tri_mul_incoming', 'tri_attn_start', 'tri_attn_end']",
+      "weights": "none; real trained weights of pairformer block 24 are injected with load_state_dict(strict=True). torch.manual_seed(20261113) still runs before building the four ops in the order ['tri_mul_outgoing', 'tri_mul_incoming', 'tri_attn_start', 'tri_attn_end'], but every parameter is overwritten, so the dumped weights do not depend on the seed",
       "input": "torch.Generator(device='cpu').manual_seed(20261113) passed to torch.randn"
     },
     "input_shape": [
