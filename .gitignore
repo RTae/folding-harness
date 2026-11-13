@@ -1,5 +1,6 @@
 # Rust
 /target/
+/tools/pairstack-oracle/reader/target/
 **/*.rs.bk
 
 # Run artifacts. Task directories default to ~/.folding_harness/tasks, but

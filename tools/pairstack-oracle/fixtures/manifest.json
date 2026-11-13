@@ -1,0 +1,1037 @@
+{
+  "meta": {
+    "generator": "tools/pairstack-oracle/generate_fixtures.py",
+    "foundry_commit": "0d0b0ba44fab7ca76aa4b625c014ce5964c7d284",
+    "foundry_src": "/private/tmp/foundry/models/rf3/src",
+    "seed": 20261113,
+    "rng": {
+      "weights": "torch.manual_seed(20261113) before building the four ops in the order ['tri_mul_outgoing', 'tri_mul_incoming', 'tri_attn_start', 'tri_attn_end']",
+      "input": "torch.Generator(device='cpu').manual_seed(20261113) passed to torch.randn"
+    },
+    "input_shape": [
+      1,
+      13,
+      13,
+      128
+    ],
+    "python": "3.12.12",
+    "torch": "2.15.0",
+    "encoding": {
+      "dtype": "float32",
+      "byte_order": "little-endian",
+      "layout": "row-major (C order)",
+      "header": "none; the file is exactly prod(shape) * 4 bytes"
+    },
+    "constants": {
+      "c_z": 128,
+      "triangle_multiplication_d_hidden": 128,
+      "triangle_attention_n_head": 4,
+      "triangle_attention_d_head": 32,
+      "layer_norm_eps": 1e-05,
+      "attention_scaling": "1/sqrt(32)",
+      "triangle_multiplication_right_operand": "divided by L"
+    }
+  },
+  "tensors": {
+    "tri_mul_outgoing.input": {
+      "path": "tensors/tri_mul_outgoing.input.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "shared pair input (B,L,L,c_z), fp32"
+    },
+    "tri_mul_outgoing.norm_pair": {
+      "path": "tensors/tri_mul_outgoing.norm_pair.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "norm_in(input), LayerNorm eps=1e-5"
+    },
+    "tri_mul_outgoing.p_combined": {
+      "path": "tensors/tri_mul_outgoing.p_combined.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        256
+      ],
+      "dtype": "float32",
+      "description": "p_in(norm_pair), last dim is 2*d_hidden, left half then right half"
+    },
+    "tri_mul_outgoing.g_combined": {
+      "path": "tensors/tri_mul_outgoing.g_combined.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        256
+      ],
+      "dtype": "float32",
+      "description": "g_in(norm_pair), last dim is 2*d_hidden, left half then right half"
+    },
+    "tri_mul_outgoing.left_gate": {
+      "path": "tensors/tri_mul_outgoing.left_gate.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "sigmoid of the left half of g_combined"
+    },
+    "tri_mul_outgoing.right_gate": {
+      "path": "tensors/tri_mul_outgoing.right_gate.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "sigmoid of the right half of g_combined"
+    },
+    "tri_mul_outgoing.left_gated": {
+      "path": "tensors/tri_mul_outgoing.left_gated.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "einsum left operand: left_gate * left half of p_combined"
+    },
+    "tri_mul_outgoing.right_gated_over_l": {
+      "path": "tensors/tri_mul_outgoing.right_gated_over_l.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "einsum right operand: (right_gate * right half of p_combined) / L"
+    },
+    "tri_mul_outgoing.einsum_raw": {
+      "path": "tensors/tri_mul_outgoing.einsum_raw.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "torch.einsum('bikd,bjkd->bijd', left_gated, right_gated_over_l), before norm_out"
+    },
+    "tri_mul_outgoing.norm_out_applied": {
+      "path": "tensors/tri_mul_outgoing.norm_out_applied.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "norm_out(einsum_raw), LayerNorm eps=1e-5"
+    },
+    "tri_mul_outgoing.out_proj": {
+      "path": "tensors/tri_mul_outgoing.out_proj.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "p_out(norm_out_applied)"
+    },
+    "tri_mul_outgoing.out_gate_logit": {
+      "path": "tensors/tri_mul_outgoing.out_gate_logit.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "g_out(norm_pair), the gate reads the normalised input"
+    },
+    "tri_mul_outgoing.out_gate": {
+      "path": "tensors/tri_mul_outgoing.out_gate.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "sigmoid(out_gate_logit)"
+    },
+    "tri_mul_outgoing.output": {
+      "path": "tensors/tri_mul_outgoing.output.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "out_gate * out_proj, the value the block adds to the residual"
+    },
+    "tri_mul_incoming.input": {
+      "path": "tensors/tri_mul_incoming.input.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "shared pair input (B,L,L,c_z), fp32"
+    },
+    "tri_mul_incoming.norm_pair": {
+      "path": "tensors/tri_mul_incoming.norm_pair.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "norm_in(input), LayerNorm eps=1e-5"
+    },
+    "tri_mul_incoming.p_combined": {
+      "path": "tensors/tri_mul_incoming.p_combined.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        256
+      ],
+      "dtype": "float32",
+      "description": "p_in(norm_pair), last dim is 2*d_hidden, left half then right half"
+    },
+    "tri_mul_incoming.g_combined": {
+      "path": "tensors/tri_mul_incoming.g_combined.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        256
+      ],
+      "dtype": "float32",
+      "description": "g_in(norm_pair), last dim is 2*d_hidden, left half then right half"
+    },
+    "tri_mul_incoming.left_gate": {
+      "path": "tensors/tri_mul_incoming.left_gate.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "sigmoid of the left half of g_combined"
+    },
+    "tri_mul_incoming.right_gate": {
+      "path": "tensors/tri_mul_incoming.right_gate.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "sigmoid of the right half of g_combined"
+    },
+    "tri_mul_incoming.left_gated": {
+      "path": "tensors/tri_mul_incoming.left_gated.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "einsum left operand: left_gate * left half of p_combined"
+    },
+    "tri_mul_incoming.right_gated_over_l": {
+      "path": "tensors/tri_mul_incoming.right_gated_over_l.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "einsum right operand: (right_gate * right half of p_combined) / L"
+    },
+    "tri_mul_incoming.einsum_raw": {
+      "path": "tensors/tri_mul_incoming.einsum_raw.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "torch.einsum('bkid,bkjd->bijd', left_gated, right_gated_over_l), before norm_out"
+    },
+    "tri_mul_incoming.norm_out_applied": {
+      "path": "tensors/tri_mul_incoming.norm_out_applied.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "norm_out(einsum_raw), LayerNorm eps=1e-5"
+    },
+    "tri_mul_incoming.out_proj": {
+      "path": "tensors/tri_mul_incoming.out_proj.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "p_out(norm_out_applied)"
+    },
+    "tri_mul_incoming.out_gate_logit": {
+      "path": "tensors/tri_mul_incoming.out_gate_logit.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "g_out(norm_pair), the gate reads the normalised input"
+    },
+    "tri_mul_incoming.out_gate": {
+      "path": "tensors/tri_mul_incoming.out_gate.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "sigmoid(out_gate_logit)"
+    },
+    "tri_mul_incoming.output": {
+      "path": "tensors/tri_mul_incoming.output.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "out_gate * out_proj, the value the block adds to the residual"
+    },
+    "tri_attn_start.input": {
+      "path": "tensors/tri_attn_start.input.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "shared pair input (B,L,L,c_z), fp32"
+    },
+    "tri_attn_start.norm_pair": {
+      "path": "tensors/tri_attn_start.norm_pair.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "norm(input), LayerNorm eps=1e-5"
+    },
+    "tri_attn_start.bias": {
+      "path": "tensors/tri_attn_start.bias.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        4
+      ],
+      "dtype": "float32",
+      "description": "to_b(norm_pair), shape (B,L,L,4), computed before the starting-node transpose"
+    },
+    "tri_attn_start.qkv_pair": {
+      "path": "tensors/tri_attn_start.qkv_pair.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "input to to_q/to_k/to_v/to_g; equals norm_pair transposed on dims -2,-1 for ending-node, norm_pair itself for starting-node"
+    },
+    "tri_attn_start.query_proj": {
+      "path": "tensors/tri_attn_start.query_proj.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "to_q(qkv_pair), shape (B,L,L,h*d)"
+    },
+    "tri_attn_start.key_proj": {
+      "path": "tensors/tri_attn_start.key_proj.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "to_k(qkv_pair), shape (B,L,L,h*d)"
+    },
+    "tri_attn_start.value_proj": {
+      "path": "tensors/tri_attn_start.value_proj.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "to_v(qkv_pair), shape (B,L,L,h*d)"
+    },
+    "tri_attn_start.gate_logit": {
+      "path": "tensors/tri_attn_start.gate_logit.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "to_g(qkv_pair), shape (B,L,L,h*d)"
+    },
+    "tri_attn_start.gate": {
+      "path": "tensors/tri_attn_start.gate.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "sigmoid(gate_logit)"
+    },
+    "tri_attn_start.query_scaled": {
+      "path": "tensors/tri_attn_start.query_scaled.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "description": "query_proj reshaped to (B,L,L,h,d) and multiplied by 1/sqrt(32)"
+    },
+    "tri_attn_start.key_heads": {
+      "path": "tensors/tri_attn_start.key_heads.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "description": "key_proj reshaped to (B,L,L,h,d)"
+    },
+    "tri_attn_start.attn_logits": {
+      "path": "tensors/tri_attn_start.attn_logits.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        13,
+        4
+      ],
+      "dtype": "float32",
+      "description": "opt_einsum contract 'bijhd,bikhd->bijkh' of query_scaled and key_heads, shape (B,i,j,k,h)"
+    },
+    "tri_attn_start.attn_with_bias": {
+      "path": "tensors/tri_attn_start.attn_with_bias.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        13,
+        4
+      ],
+      "dtype": "float32",
+      "description": "attn_logits + bias.unsqueeze(1); the bias keeps its untransposed orientation"
+    },
+    "tri_attn_start.attn_weights": {
+      "path": "tensors/tri_attn_start.attn_weights.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        13,
+        4
+      ],
+      "dtype": "float32",
+      "description": "softmax(attn_with_bias, dim=-2), shape (B,i,j,k,h)"
+    },
+    "tri_attn_start.value_heads": {
+      "path": "tensors/tri_attn_start.value_heads.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "description": "value_proj reshaped to (B,L,L,h,d)"
+    },
+    "tri_attn_start.attn_out_heads": {
+      "path": "tensors/tri_attn_start.attn_out_heads.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "description": "opt_einsum contract 'bijkh,bikhd->bijhd' of attn_weights and value_heads, shape (B,i,j,h,d)"
+    },
+    "tri_attn_start.gated_out": {
+      "path": "tensors/tri_attn_start.gated_out.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "gate * attn_out_heads reshaped to (B,L,L,h*d), transposed back for ending-node; the input to to_out"
+    },
+    "tri_attn_start.output": {
+      "path": "tensors/tri_attn_start.output.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "to_out(gated_out), the value the block adds to the residual"
+    },
+    "tri_attn_end.input": {
+      "path": "tensors/tri_attn_end.input.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "shared pair input (B,L,L,c_z), fp32"
+    },
+    "tri_attn_end.norm_pair": {
+      "path": "tensors/tri_attn_end.norm_pair.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "norm(input), LayerNorm eps=1e-5"
+    },
+    "tri_attn_end.bias": {
+      "path": "tensors/tri_attn_end.bias.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        4
+      ],
+      "dtype": "float32",
+      "description": "to_b(norm_pair), shape (B,L,L,4), computed before the ending-node transpose"
+    },
+    "tri_attn_end.qkv_pair": {
+      "path": "tensors/tri_attn_end.qkv_pair.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "input to to_q/to_k/to_v/to_g; equals norm_pair transposed on dims -2,-1 for ending-node, norm_pair itself for starting-node"
+    },
+    "tri_attn_end.query_proj": {
+      "path": "tensors/tri_attn_end.query_proj.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "to_q(qkv_pair), shape (B,L,L,h*d)"
+    },
+    "tri_attn_end.key_proj": {
+      "path": "tensors/tri_attn_end.key_proj.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "to_k(qkv_pair), shape (B,L,L,h*d)"
+    },
+    "tri_attn_end.value_proj": {
+      "path": "tensors/tri_attn_end.value_proj.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "to_v(qkv_pair), shape (B,L,L,h*d)"
+    },
+    "tri_attn_end.gate_logit": {
+      "path": "tensors/tri_attn_end.gate_logit.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "to_g(qkv_pair), shape (B,L,L,h*d)"
+    },
+    "tri_attn_end.gate": {
+      "path": "tensors/tri_attn_end.gate.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "sigmoid(gate_logit)"
+    },
+    "tri_attn_end.query_scaled": {
+      "path": "tensors/tri_attn_end.query_scaled.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "description": "query_proj reshaped to (B,L,L,h,d) and multiplied by 1/sqrt(32)"
+    },
+    "tri_attn_end.key_heads": {
+      "path": "tensors/tri_attn_end.key_heads.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "description": "key_proj reshaped to (B,L,L,h,d)"
+    },
+    "tri_attn_end.attn_logits": {
+      "path": "tensors/tri_attn_end.attn_logits.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        13,
+        4
+      ],
+      "dtype": "float32",
+      "description": "opt_einsum contract 'bijhd,bikhd->bijkh' of query_scaled and key_heads, shape (B,i,j,k,h)"
+    },
+    "tri_attn_end.attn_with_bias": {
+      "path": "tensors/tri_attn_end.attn_with_bias.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        13,
+        4
+      ],
+      "dtype": "float32",
+      "description": "attn_logits + bias.unsqueeze(1); the bias keeps its untransposed orientation"
+    },
+    "tri_attn_end.attn_weights": {
+      "path": "tensors/tri_attn_end.attn_weights.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        13,
+        4
+      ],
+      "dtype": "float32",
+      "description": "softmax(attn_with_bias, dim=-2), shape (B,i,j,k,h)"
+    },
+    "tri_attn_end.value_heads": {
+      "path": "tensors/tri_attn_end.value_heads.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "description": "value_proj reshaped to (B,L,L,h,d)"
+    },
+    "tri_attn_end.attn_out_heads": {
+      "path": "tensors/tri_attn_end.attn_out_heads.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        4,
+        32
+      ],
+      "dtype": "float32",
+      "description": "opt_einsum contract 'bijkh,bikhd->bijhd' of attn_weights and value_heads, shape (B,i,j,h,d)"
+    },
+    "tri_attn_end.gated_out": {
+      "path": "tensors/tri_attn_end.gated_out.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "gate * attn_out_heads reshaped to (B,L,L,h*d), transposed back for ending-node; the input to to_out"
+    },
+    "tri_attn_end.output": {
+      "path": "tensors/tri_attn_end.output.f32",
+      "shape": [
+        1,
+        13,
+        13,
+        128
+      ],
+      "dtype": "float32",
+      "description": "to_out(gated_out), the value the block adds to the residual"
+    }
+  },
+  "weights": {
+    "tri_mul_outgoing": {
+      "norm_in.weight": {
+        "path": "weights/tri_mul_outgoing/norm_in.weight.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "norm_in.bias": {
+        "path": "weights/tri_mul_outgoing/norm_in.bias.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "p_in.weight": {
+        "path": "weights/tri_mul_outgoing/p_in.weight.f32",
+        "shape": [
+          256,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "g_in.weight": {
+        "path": "weights/tri_mul_outgoing/g_in.weight.f32",
+        "shape": [
+          256,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "norm_out.weight": {
+        "path": "weights/tri_mul_outgoing/norm_out.weight.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "norm_out.bias": {
+        "path": "weights/tri_mul_outgoing/norm_out.bias.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "p_out.weight": {
+        "path": "weights/tri_mul_outgoing/p_out.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "g_out.weight": {
+        "path": "weights/tri_mul_outgoing/g_out.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "tri_mul_incoming": {
+      "norm_in.weight": {
+        "path": "weights/tri_mul_incoming/norm_in.weight.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "norm_in.bias": {
+        "path": "weights/tri_mul_incoming/norm_in.bias.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "p_in.weight": {
+        "path": "weights/tri_mul_incoming/p_in.weight.f32",
+        "shape": [
+          256,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "g_in.weight": {
+        "path": "weights/tri_mul_incoming/g_in.weight.f32",
+        "shape": [
+          256,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "norm_out.weight": {
+        "path": "weights/tri_mul_incoming/norm_out.weight.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "norm_out.bias": {
+        "path": "weights/tri_mul_incoming/norm_out.bias.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "p_out.weight": {
+        "path": "weights/tri_mul_incoming/p_out.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "g_out.weight": {
+        "path": "weights/tri_mul_incoming/g_out.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "tri_attn_start": {
+      "norm.weight": {
+        "path": "weights/tri_attn_start/norm.weight.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "norm.bias": {
+        "path": "weights/tri_attn_start/norm.bias.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_q.weight": {
+        "path": "weights/tri_attn_start/to_q.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_k.weight": {
+        "path": "weights/tri_attn_start/to_k.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_v.weight": {
+        "path": "weights/tri_attn_start/to_v.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_b.weight": {
+        "path": "weights/tri_attn_start/to_b.weight.f32",
+        "shape": [
+          4,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_g.weight": {
+        "path": "weights/tri_attn_start/to_g.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_g.bias": {
+        "path": "weights/tri_attn_start/to_g.bias.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_out.weight": {
+        "path": "weights/tri_attn_start/to_out.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_out.bias": {
+        "path": "weights/tri_attn_start/to_out.bias.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      }
+    },
+    "tri_attn_end": {
+      "norm.weight": {
+        "path": "weights/tri_attn_end/norm.weight.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "norm.bias": {
+        "path": "weights/tri_attn_end/norm.bias.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_q.weight": {
+        "path": "weights/tri_attn_end/to_q.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_k.weight": {
+        "path": "weights/tri_attn_end/to_k.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_v.weight": {
+        "path": "weights/tri_attn_end/to_v.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_b.weight": {
+        "path": "weights/tri_attn_end/to_b.weight.f32",
+        "shape": [
+          4,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_g.weight": {
+        "path": "weights/tri_attn_end/to_g.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_g.bias": {
+        "path": "weights/tri_attn_end/to_g.bias.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_out.weight": {
+        "path": "weights/tri_attn_end/to_out.weight.f32",
+        "shape": [
+          128,
+          128
+        ],
+        "dtype": "float32"
+      },
+      "to_out.bias": {
+        "path": "weights/tri_attn_end/to_out.bias.f32",
+        "shape": [
+          128
+        ],
+        "dtype": "float32"
+      }
+    }
+  }
+}
