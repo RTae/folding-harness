@@ -1,0 +1,16 @@
+[package]
+name = "pairstack"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+description = "CPU reference implementation of the AlphaFold 3 family pair-stack triangle operations"
+
+# The library has no dependencies. A hand-rolled flat tensor keeps the numerical
+# core portable to a later GPU toolchain. serde_json parses the oracle manifest
+# and is only needed by the fixture-backed tests.
+[dependencies]
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
