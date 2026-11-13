@@ -76,7 +76,14 @@ fn framework_positions_cannot_be_proposed() {
             "test",
         )
         .expect_err("framework position must be refused");
-    assert_eq!(err, ProposalError::Immutable { chain, position: 0 });
+    assert_eq!(
+        err,
+        ProposalError::Immutable {
+            chain,
+            label: "H".to_string(),
+            position: 0
+        }
+    );
 
     // The pinned position inside a region is refused the same way.
     let err = scope
@@ -95,6 +102,7 @@ fn framework_positions_cannot_be_proposed() {
         err,
         ProposalError::Immutable {
             chain,
+            label: "H".to_string(),
             position: 29
         }
     );
@@ -165,6 +173,7 @@ fn non_standard_residues_and_repeats_are_refused() {
         err,
         ProposalError::DuplicatePosition {
             chain,
+            label: "H".to_string(),
             position: 28
         }
     );
