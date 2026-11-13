@@ -211,9 +211,23 @@ BioNeMo's own tolerances, from its tests, are the ladder to copy.
 - Downstream, agreement is measured as lDDT and DockQ against ground truth, and
   a gap between two sides is treated as a finding rather than as noise.
 
-The CPU reference in Rust is held to the bit-exact standard against the fp32
-foundry path, not to the reduced-precision ladder, because the oracle calls the
-operations directly in fp32 with no trainer and no autocast.
+The CPU reference in Rust is held to the fp32 tolerances above rather than to
+the reduced-precision ladder, because the oracle calls the operations directly
+in fp32 with no trainer and no autocast. Bit-exactness is not one of the
+targets and cannot be, since summation order differs between PyTorch's einsum
+and any independent implementation, so a test demanding it fails for a reason
+that is not a bug.
+
+One caution on reading the numbers. A fixed absolute bound means different
+things at different tensor scales, and the scale here is set by the weights.
+Against randomly initialised weights the attention output was zero, so any
+absolute deviation looked excellent. Against real weights from block 24 the
+same output reaches magnitude 82, and the measured worst deviation of 1.53e-4
+is about 20 f32 ulps at that magnitude, roughly 2e-6 relative, which is
+summation-order noise between PyTorch's f32 accumulation and an
+f64-accumulate-then-round-once path. Compare against the tolerance and against
+the tensor's own scale. Do not carry an absolute bound from one fixture set to
+the next.
 
 ## CPU feasibility
 
