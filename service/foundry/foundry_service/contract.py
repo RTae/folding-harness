@@ -11,6 +11,12 @@ a field marked `skip_serializing_if = "Option::is_none"` is omitted from the
 wire dict when it is None, and one marked `skip_serializing_if =
 "Vec::is_empty"` is omitted when the list is empty. A field marked
 `#[serde(default)]` may be absent on input.
+
+JSON has one number type, so a wire payload cannot say whether a Rust field
+is a `u8`, a `u32` or an `f64`. Every integer field therefore enforces the
+range of the width `src/contract.rs` declares at parse time, and
+`tests/test_contract_conformance.py` probes those ranges against the widths
+it parses from the Rust source.
 """
 
 from __future__ import annotations
@@ -88,7 +94,10 @@ class ChainSpec:
                 f"{[k.value for k in MoleculeKind]}"
             ) from None
         return cls(
-            label=label, sequence=sequence, kind=kind, designed=bool(wire.get("designed", False))
+            label=label,
+            sequence=sequence,
+            kind=kind,
+            designed=_bool(wire.get("designed", False), f"chains[{label}].designed"),
         )
 
 
@@ -124,11 +133,11 @@ class JobSpec:
             name=_require_str(wire, "name", "job"),
             model=_require_str(wire, "model", "job"),
             chains=[ChainSpec.from_wire(chain) for chain in chains_wire],
-            seeds=[int(seed) for seed in _require(wire, "seeds", "job")],
-            diffusion_samples=int(_require(wire, "diffusion_samples", "job")),
-            diffusion_steps=int(_require(wire, "diffusion_steps", "job")),
-            use_msa=bool(_require(wire, "use_msa", "job")),
-            need_atom_confidence=bool(_require(wire, "need_atom_confidence", "job")),
+            seeds=[_uint(seed, "job.seeds entry", 64) for seed in _require(wire, "seeds", "job")],
+            diffusion_samples=_require_uint(wire, "diffusion_samples", "job", 32),
+            diffusion_steps=_require_uint(wire, "diffusion_steps", "job", 32),
+            use_msa=_require_bool(wire, "use_msa", "job"),
+            need_atom_confidence=_require_bool(wire, "need_atom_confidence", "job"),
         )
 
 
@@ -164,7 +173,9 @@ class JobAccepted:
         position = wire.get("queue_position")
         return cls(
             job_id=_require_str(wire, "job_id", "job_accepted"),
-            queue_position=None if position is None else int(position),
+            queue_position=None
+            if position is None
+            else _uint(position, "job_accepted.queue_position", 32),
         )
 
 
@@ -203,17 +214,17 @@ class ConfidenceReport:
     def from_wire(cls, wire: dict) -> ConfidenceReport:
         where = "confidence"
         return cls(
-            iptm=float(_require(wire, "iptm", where)),
-            ptm=float(_require(wire, "ptm", where)),
-            plddt_mean=float(_require(wire, "plddt_mean", where)),
-            interface_plddt=float(_require(wire, "interface_plddt", where)),
-            pae_interface=float(_require(wire, "pae_interface", where)),
-            interface_contacts=int(_require(wire, "interface_contacts", where)),
-            clashes=int(_require(wire, "clashes", where)),
-            hydrophobic_patch=float(_require(wire, "hydrophobic_patch", where)),
-            net_charge=float(_require(wire, "net_charge", where)),
-            atom_confidence=bool(_require(wire, "atom_confidence", where)),
-            plddt=[float(value) for value in wire.get("plddt", [])],
+            iptm=_require_num(wire, "iptm", where),
+            ptm=_require_num(wire, "ptm", where),
+            plddt_mean=_require_num(wire, "plddt_mean", where),
+            interface_plddt=_require_num(wire, "interface_plddt", where),
+            pae_interface=_require_num(wire, "pae_interface", where),
+            interface_contacts=_require_uint(wire, "interface_contacts", where, 32),
+            clashes=_require_uint(wire, "clashes", where, 32),
+            hydrophobic_patch=_require_num(wire, "hydrophobic_patch", where),
+            net_charge=_require_num(wire, "net_charge", where),
+            atom_confidence=_require_bool(wire, "atom_confidence", where),
+            plddt=[_num(value, "confidence.plddt entry") for value in wire.get("plddt", [])],
         )
 
 
@@ -242,13 +253,23 @@ class CaResidue:
         xyz = _require(wire, "xyz", where)
         if len(xyz) != 3:
             raise ValueError(f"ca_trace entry xyz must hold 3 numbers, got {len(xyz)}")
+        residue = _require_str(wire, "residue", where)
+        if len(residue) != 1:
+            raise ValueError(
+                "ca_trace entry.residue must be a single character to match the Rust "
+                f"char, got {residue!r}"
+            )
         return cls(
-            chain_index=int(_require(wire, "chain_index", where)),
-            index=int(_require(wire, "index", where)),
-            residue=_require_str(wire, "residue", where),
-            xyz=(float(xyz[0]), float(xyz[1]), float(xyz[2])),
-            plddt=float(_require(wire, "plddt", where)),
-            designed=bool(_require(wire, "designed", where)),
+            chain_index=_require_uint(wire, "chain_index", where, 8),
+            index=_require_uint(wire, "index", where, 32),
+            residue=residue,
+            xyz=(
+                _num(xyz[0], "ca_trace entry.xyz[0]"),
+                _num(xyz[1], "ca_trace entry.xyz[1]"),
+                _num(xyz[2], "ca_trace entry.xyz[2]"),
+            ),
+            plddt=_require_num(wire, "plddt", where),
+            designed=_require_bool(wire, "designed", where),
         )
 
 
@@ -282,8 +303,8 @@ class StructurePayload:
             ) from None
         return cls(
             format=payload_format,
-            inline=wire.get("inline"),
-            artifact_url=wire.get("artifact_url"),
+            inline=_opt_str(wire, "inline", where),
+            artifact_url=_opt_str(wire, "artifact_url", where),
             ca_trace=[CaResidue.from_wire(entry) for entry in wire.get("ca_trace", [])],
         )
 
@@ -313,7 +334,7 @@ class FoldResult:
             model=_require_str(wire, "model", where),
             confidence=ConfidenceReport.from_wire(_require(wire, "confidence", where)),
             structure=StructurePayload.from_wire(_require(wire, "structure", where)),
-            elapsed_ms=int(_require(wire, "elapsed_ms", where)),
+            elapsed_ms=_require_uint(wire, "elapsed_ms", where, 64),
         )
 
 
@@ -346,7 +367,7 @@ class JobStatus:
         return cls(
             job_id=_require_str(wire, "job_id", where),
             state=state,
-            message=wire.get("message"),
+            message=_opt_str(wire, "message", where),
             result=None if result_wire is None else FoldResult.from_wire(result_wire),
         )
 
@@ -372,10 +393,10 @@ class GpuInfo:
     def from_wire(cls, wire: dict) -> GpuInfo:
         where = "gpus entry"
         return cls(
-            index=int(_require(wire, "index", where)),
+            index=_require_uint(wire, "index", where, 32),
             name=_require_str(wire, "name", where),
-            memory_total_mb=int(_require(wire, "memory_total_mb", where)),
-            leased_by=wire.get("leased_by"),
+            memory_total_mb=_require_uint(wire, "memory_total_mb", where, 64),
+            leased_by=_opt_str(wire, "leased_by", where),
         )
 
 
@@ -410,9 +431,11 @@ class Health:
             protocol=_require_str(wire, "protocol", where),
             service=_require_str(wire, "service", where),
             version=_require_str(wire, "version", where),
-            capabilities=[str(c) for c in _require(wire, "capabilities", where)],
-            queue_depth=int(_require(wire, "queue_depth", where)),
-            models=[str(m) for m in wire.get("models", [])],
+            capabilities=[
+                _str(c, "health.capabilities entry") for c in _require(wire, "capabilities", where)
+            ],
+            queue_depth=_require_uint(wire, "queue_depth", where, 32),
+            models=[_str(m, "health.models entry") for m in wire.get("models", [])],
             gpus=[GpuInfo.from_wire(g) for g in wire.get("gpus", [])],
         )
 
@@ -430,7 +453,10 @@ class ErrorBody:
 
     @classmethod
     def from_wire(cls, wire: dict) -> ErrorBody:
-        return cls(error=_require_str(wire, "error", "error body"), detail=wire.get("detail"))
+        return cls(
+            error=_require_str(wire, "error", "error body"),
+            detail=_opt_str(wire, "detail", "error body"),
+        )
 
 
 def _require(wire: dict, key: str, where: str):
@@ -439,8 +465,61 @@ def _require(wire: dict, key: str, where: str):
     return wire[key]
 
 
-def _require_str(wire: dict, key: str, where: str) -> str:
-    value = _require(wire, key, where)
+def _str(value, where: str) -> str:
+    """Parse one JSON string. `str()` coercion is not enough, because serde
+    rejects a JSON number for a Rust `String`, but `str(5)` is `"5"`.
+    """
     if not isinstance(value, str):
-        raise ValueError(f"{where}.{key} must be a string, got {type(value).__name__}")
+        raise ValueError(f"{where} must be a string, got {type(value).__name__}")
     return value
+
+
+def _require_str(wire: dict, key: str, where: str) -> str:
+    return _str(_require(wire, key, where), f"{where}.{key}")
+
+
+def _opt_str(wire: dict, key: str, where: str) -> str | None:
+    """Parse one `Option<String>` field the way serde does. A missing key and
+    a JSON null both mean None, and any other non-string is a type error.
+    """
+    value = wire.get(key)
+    return None if value is None else _str(value, f"{where}.{key}")
+
+
+def _uint(value, where: str, bits: int) -> int:
+    """Parse one unsigned integer the way serde parses a Rust `u{bits}`."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{where} must be an integer, got {type(value).__name__}")
+    if not 0 <= value <= 2**bits - 1:
+        raise ValueError(f"{where} is {value}, outside the u{bits} range 0..{2**bits - 1}")
+    return value
+
+
+def _require_uint(wire: dict, key: str, where: str, bits: int) -> int:
+    return _uint(_require(wire, key, where), f"{where}.{key}", bits)
+
+
+def _bool(value, where: str) -> bool:
+    """Parse one JSON boolean. `bool()` coercion is not enough, because serde
+    rejects the string `"no"` for a Rust `bool`, but `bool("no")` is `True`.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"{where} must be a boolean, got {type(value).__name__}")
+    return value
+
+
+def _require_bool(wire: dict, key: str, where: str) -> bool:
+    return _bool(_require(wire, key, where), f"{where}.{key}")
+
+
+def _num(value, where: str) -> float:
+    """Parse one JSON number. `bool` is rejected because serde rejects a
+    JSON `true` for an `f32` or `f64` field.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where} must be a number, got {type(value).__name__}")
+    return float(value)
+
+
+def _require_num(wire: dict, key: str, where: str) -> float:
+    return _num(_require(wire, key, where), f"{where}.{key}")
